@@ -1,0 +1,52 @@
+# ============================================================
+# 全局配置文件
+# 环境切换：pytest --env <环境名>（或设置环境变量 TEST_ENV），无需再手动注释/解注释
+# ============================================================
+
+# 默认执行环境（未指定 --env 时使用）
+default_env: "client-dev"
+
+# 环境列表
+#   base_url      接口地址
+#   caseData_path 用例目录
+#   prod: true    标记为正式环境，执行必须显式追加 --confirm-prod（或环境变量 ALLOW_PROD=1）
+environments:
+  client-dev:
+    base_url: "https://www.ziulife.com/client-api-dev/client"
+    caseData_path: "data/client_data"
+  client-prod:
+    base_url: "https://www.ziulife.com/client-api-prod/client"
+    caseData_path: "data/client_data"
+    prod: true
+  station-dev:
+    base_url: "https://www.ziulife.com/station-api-dev"
+    caseData_path: "data/station_data"
+  station-prod:
+    base_url: "https://www.ziulife.com/station-api-prod"
+    caseData_path: "data/station_data"
+    prod: true
+
+# 请求超时时间（秒）
+timeout: 30
+
+# 请求失败重试次数（5xx仅对幂等方法GET/HEAD/OPTIONS重试；连接类错误对所有方法重试）
+retry_times: 3
+
+# 重试间隔（秒）
+retry_delay: 2.0
+
+# 预置变量：所有用例可通过 ${变量名} 引用；值支持 $ENV{环境变量名} 引用环境变量（敏感数据外部化）
+# 示例：
+# variables:
+#   test_mobile: "$ENV{TEST_MOBILE}"
+variables: {}
+
+# 日志配置
+log:
+  level: "INFO"
+  file_path: "logs/api_test.log"
+
+# Allure报告配置
+allure:
+  report_dir: "reports/allure-results"
+  clean: true

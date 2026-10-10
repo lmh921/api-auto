@@ -1,0 +1,78 @@
+# 多接口测试用例模板
+description: "这是一个多接口测试用例模板"
+tags: ["示例", "多接口"]
+
+# 全局变量
+global_variables:
+  base_url: "http://example.com/api"
+  username: "test_user"
+  password: "test_pass"
+
+# 测试用例列表
+testcases:
+  # 第一个测试用例：登录接口
+  - name: "登录接口测试"
+    description: "测试用户登录功能"
+    request:
+      method: "POST"
+      url: "/login"
+      headers:
+        Content-Type: "application/json"
+      json:
+        username: "${username}"
+        password: "${password}"
+    assertions:
+      - type: "status_code"
+        expected: 200
+        message: "检查登录状态码"
+      - type: "equal"
+        jsonpath: "code"
+        expected: 0
+        message: "检查登录成功返回码"
+      - type: "contains"
+        jsonpath: "message"
+        expected: "成功"
+        message: "检查登录成功消息"
+    extract:
+      token: "data.token"
+      user_id: "data.user_id"
+  
+  # 第二个测试用例：获取用户信息接口（依赖登录获取的token）
+  - name: "获取用户信息接口测试"
+    description: "测试获取用户信息功能"
+    request:
+      method: "GET"
+      url: "/users/${user_id}"
+      headers:
+        Content-Type: "application/json"
+        Authorization: "Bearer ${token}"
+    assertions:
+      - type: "status_code"
+        expected: 200
+        message: "检查获取用户信息状态码"
+      - type: "equal"
+        jsonpath: "data.id"
+        expected: "${user_id}"
+        message: "检查用户ID一致"
+      - type: "equal"
+        jsonpath: "data.username"
+        expected: "${username}"
+        message: "检查用户名一致"
+  
+  # 第三个测试用例：退出登录接口
+  - name: "退出登录接口测试"
+    description: "测试退出登录功能"
+    request:
+      method: "POST"
+      url: "/logout"
+      headers:
+        Content-Type: "application/json"
+        Authorization: "Bearer ${token}"
+    assertions:
+      - type: "status_code"
+        expected: 200
+        message: "检查退出登录状态码"
+      - type: "equal"
+        jsonpath: "code"
+        expected: 0
+        message: "检查退出登录成功返回码"

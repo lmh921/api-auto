@@ -1,0 +1,128 @@
+# 示例测试用例 - 使用JSONPlaceholder API
+description: "使用JSONPlaceholder API演示接口自动化测试框架功能"
+tags: ["示例", "JSONPlaceholder", "API"]
+
+# 测试环境配置
+env:
+  base_url: "https://jsonplaceholder.typicode.com"
+  timeout: 15
+
+# 测试用例列表
+testcases:
+  # 1. 获取用户列表
+  - name: "获取用户列表"
+    description: "测试GET /users接口获取用户列表"
+    tags: ["GET", "用户管理"]
+    request:
+      method: "GET"
+      url: "/users"
+      headers:
+        Content-Type: "application/json"
+    assertions:
+      - type: "status_code"
+        expected: 200
+        message: "检查响应状态码"
+      - type: "greater_than"
+        jsonpath: "$length"
+        expected: 5
+        message: "检查用户列表数量大于5"
+    extract:
+      first_user_id: "[0].id"
+      first_user_name: "[0].name"
+
+  # 2. 获取单个用户
+  - name: "获取单个用户信息"
+    description: "测试GET /users/{id}接口获取单个用户信息"
+    tags: ["GET", "用户管理"]
+    request:
+      method: "GET"
+      url: "/users/${first_user_id}"
+      headers:
+        Content-Type: "application/json"
+    assertions:
+      - type: "status_code"
+        expected: 200
+        message: "检查响应状态码"
+      - type: "equal"
+        jsonpath: "id"
+        expected: "${first_user_id}"
+        message: "检查用户ID一致"
+      - type: "equal"
+        jsonpath: "name"
+        expected: "${first_user_name}"
+        message: "检查用户名一致"
+
+  # 3. 创建用户
+  - name: "创建新用户"
+    description: "测试POST /users接口创建新用户"
+    tags: ["POST", "用户管理"]
+    request:
+      method: "POST"
+      url: "/users"
+      headers:
+        Content-Type: "application/json"
+      json:
+        name: "测试用户"
+        username: "testuser"
+        email: "test@example.com"
+        address:
+          street: "测试街道"
+          city: "测试城市"
+        phone: "1234567890"
+        website: "test.example.com"
+        company:
+          name: "测试公司"
+    assertions:
+      - type: "status_code"
+        expected: 201
+        message: "检查响应状态码"
+      - type: "equal"
+        jsonpath: "name"
+        expected: "测试用户"
+        message: "检查创建的用户名"
+      - type: "equal"
+        jsonpath: "email"
+        expected: "test@example.com"
+        message: "检查创建的用户邮箱"
+    extract:
+      new_user_id: "id"
+
+  # 4. 更新用户
+  - name: "更新用户信息"
+    description: "测试PUT /users/{id}接口更新用户信息"
+    tags: ["PUT", "用户管理"]
+    request:
+      method: "PUT"
+      url: "/users/${new_user_id}"
+      headers:
+        Content-Type: "application/json"
+      json:
+        name: "更新后的测试用户"
+        username: "updateduser"
+        email: "updated@example.com"
+    assertions:
+      - type: "status_code"
+        expected: 200
+        message: "检查响应状态码"
+      - type: "equal"
+        jsonpath: "name"
+        expected: "更新后的测试用户"
+        message: "检查更新后的用户名"
+      - type: "equal"
+        jsonpath: "username"
+        expected: "updateduser"
+        message: "检查更新后的用户名"
+
+  # 5. 删除用户
+  - name: "删除用户"
+    description: "测试DELETE /users/{id}接口删除用户"
+    tags: ["DELETE", "用户管理"]
+    request:
+      method: "DELETE"
+      url: "/users/${new_user_id}"
+      headers:
+        Content-Type: "application/json"
+    assertions:
+      - type: "status_code"
+        expected: 200
+        message: "检查响应状态码"

@@ -1,0 +1,55 @@
+# 测试用例列表
+# 登录已提取为文件级前置步骤(setup)，token自动注入全局变量供所有用例使用
+setup:
+  steps:
+    - name: "用户登录（前置）"
+      description: "测试用户登录接口 /appUser/codeLogin"
+      request:
+        method: "POST"
+        url: "/appUser/codeLogin"
+        headers:
+          Content-Type: "application/json"
+        json:
+          mobile: "19999999999"
+          code: "000000"
+          registrationId: "string"
+      assertions:
+        - type: "status_code"
+          expected: 200
+          message: "登录检查响应状态码"
+      extract:
+        token: "data.token"
+
+testcases:
+  # 测试用例：获取用户信息接口（token来自setup）
+  - name: "获取用户信息"
+    description: "测试获取用户登录信息接口 /appUser/info"
+    tags: [ "get","用户信息" ]
+    request:
+      method: "GET"
+      url: "/appUser/info"
+      headers:
+        Authorization: "Bearer ${token}"
+    assertions:
+      - type: "status_code"
+        expected: 200
+        message: "检查响应状态码"
+
+  # 测试用例：修改用户信息（token来自setup）
+  - name: "修改用户信息"
+    description: "测试修改用户信息接口 /appUser/update"
+    tags: ["PUT","修改用户"]
+    request:
+      method: "PUT"
+      url: "/appUser/update"
+      headers:
+        Content-Type: "application/json"
+        Authorization: "Bearer ${token}"
+      json:
+        username: "liuSri"
+        nickname: "测试组长"
+        avatarUrl: "https://example.com/avatar.jpg"
+    assertions:
+      - type: "status_code"
+        expected: 200
+        message: "检查响应状态码"

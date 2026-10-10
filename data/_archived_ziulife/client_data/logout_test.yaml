@@ -1,0 +1,41 @@
+# 测试用例列表
+# 登录已提取为文件级前置步骤(setup)，token自动注入全局变量供所有用例使用
+# 注意：退出登录会使用户状态变化，本文件setup不开启cache，每次执行都会重新登录
+setup:
+  steps:
+    - name: "用户登录（前置）"
+      description: "测试用户登录接口 /appUser/codeLogin"
+      request:
+        method: "POST"
+        url: "/appUser/codeLogin"
+        headers:
+          Content-Type: "application/json"
+        json:
+          mobile: "19999999999"
+          code: "000000"
+          registrationId: "string"
+      assertions:
+        - type: "status_code"
+          expected: 200
+          message: "登录检查响应状态码"
+      extract:
+        token: "data.token"
+
+testcases:
+  # 测试用例：退出登录接口（token来自setup）
+  - name: "退出登录"
+    description: "测试获取用户退出登录接口 /appUser/logout"
+    tags: [ "POST","退出登录" ]
+    request:
+      method: "POST"
+      url: "/appUser/logout"
+      headers:
+        Authorization: "Bearer ${token}"
+    assertions:
+      - type: "status_code"
+        expected: 200
+        message: "检查响应状态码"
+      - type: "equal"
+        jsonpath: "message"
+        expected: "退出成功"
+        message: "检查接口响应信息"

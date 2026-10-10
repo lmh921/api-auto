@@ -1,0 +1,39 @@
+## 测试用例列表
+#testcases:
+#  # 第一个测试用例：用户登录接口
+#  - name: "验证用户登录"
+#    description: "测试用户登录接口 /appUser/codeLogin"
+#    tags: ["post","用户登录"]
+#    request:
+#      method: "POST"
+#      url: "/appUser/codeLogin"
+#      headers:
+#        Content-Type: "application/json"
+#      json:
+#        mobile: "19999999999"
+#        code: "000000"
+#        registrationId: "string"
+#    assertions:
+#      - type: "status_code"
+#        expected: 200
+#        message: "检查响应状态码"
+#    extract:
+#      token: "data.token"
+#
+#  # 第二个测试用例：注销用户接口（依赖登录获取的token）
+#  - name: "注销用户"
+#    description: "测试获取用户注销功能接口 /appUser/deactivate"
+#    tags: [ "DELETE","注销用户" ]
+#    request:
+#      method: "DELETE"
+#      url: "/appUser/deactivate"
+#      headers:
+#        Authorization: "Bearer ${token}"
+#    assertions:
+#      - type: "status_code"
+#        expected: 200
+#        message: "检查接口响应状态码"
+#      - type: "equal"
+#        jsonpath: "message"
+#        expected: "账号已注销，感谢您的使用"
+#        message: "检查接口响应信息"

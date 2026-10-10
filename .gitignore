@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.venv-ci/
+.pytest_cache/
+
+# IDE
+.idea/
+
+# 运行产物
+logs/
+reports/
+
+# 系统文件
+Thumbs.db
+.DS_Store

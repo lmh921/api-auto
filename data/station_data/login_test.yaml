@@ -1,0 +1,32 @@
+# 测试环境配置
+env:
+  base_url: "https://www.ziulife.com/station-api-dev"
+  timeout: 15
+
+
+# 驿站老板登录接口
+name: "验证驿站老板登录"
+description: "测试驿站老板登录接口 /smsLogin"
+tags: ["post","驿站老板登录"]
+
+# 请求配置
+request:
+  method: "POST"
+  url: "/smsLogin"
+  headers:
+    Content-Type: "application/json"
+  json:
+    userCustomType: 2
+    phone: "17550307717"
+    smsCode: "000000"
+    registrationId: "string"
+
+# 断言配置
+assertions:
+  - type: "status_code"
+    expected: 200
+    message: "检查响应状态码"
+
+# 变量提取（用于后续接口调用）
+extract:
+  token: "data.token"

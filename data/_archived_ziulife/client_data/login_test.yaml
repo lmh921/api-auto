@@ -1,0 +1,31 @@
+# 测试环境配置
+env:
+  base_url: "https://www.ziulife.com/client-api-dev/client"
+  timeout: 15
+
+
+# 用户登录接口
+name: "验证用户登录"
+description: "测试用户登录接口 /appUser/codeLogin"
+tags: ["post","用户登录"]
+
+# 请求配置
+request:
+  method: "POST"
+  url: "/appUser/codeLogin"
+  headers:
+    Content-Type: "application/json"
+  json:
+    mobile: "19999999999"
+    code: "000000"
+    registrationId: "string"
+
+# 断言配置
+assertions:
+  - type: "status_code"
+    expected: 200
+    message: "检查响应状态码"
+
+# 变量提取（用于后续接口调用）
+extract:
+  token: "data.token"

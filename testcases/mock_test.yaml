@@ -1,0 +1,56 @@
+# 模拟测试用例 - 不依赖外部API
+description: "模拟测试用例，用于验证框架功能"
+tags: ["模拟", "框架测试"]
+
+# 测试用例列表
+testcases:
+  # 1. 成功测试用例
+  - name: "模拟成功请求"
+    description: "测试框架基本功能"
+    tags: ["GET", "成功"]
+    request:
+      method: "GET"
+      url: "https://httpbin.org/get"
+      params:
+        name: "test"
+        age: 18
+      headers:
+        Content-Type: "application/json"
+        Custom-Header: "test-value"
+    assertions:
+      - type: "status_code"
+        expected: 200
+        message: "检查响应状态码"
+      - type: "contains"
+        jsonpath: "url"
+        expected: "https://httpbin.org/get"
+        message: "检查URL包含"
+      - type: "equal"
+        jsonpath: "args.name"
+        expected: "test"
+        message: "检查参数name"
+    extract:
+      request_url: "url"
+
+  # 2. 响应包含测试
+  - name: "模拟响应包含测试"
+    description: "测试断言包含功能"
+    tags: ["POST", "包含"]
+    request:
+      method: "POST"
+      url: "https://httpbin.org/post"
+      json:
+        username: "admin"
+        password: "123456"
+    assertions:
+      - type: "status_code"
+        expected: 200
+        message: "检查响应状态码"
+      - type: "contains"
+        jsonpath: "json.username"
+        expected: "admin"
+        message: "检查响应包含username"
+      - type: "contains"
+        jsonpath: "headers.Content-Type"
+        expected: "application/json"
+        message: "检查Content-Type头"
