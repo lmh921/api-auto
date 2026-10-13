@@ -17,9 +17,16 @@ from utils.yaml_parser import YamlParser
 FILE_SETUPS: Dict[str, Dict[str, Any]] = {}
 
 # 单条用例/前置步骤的结构规则
+# request 不再强制：纯数据库校验用例（只含 db_setup/db_assertions/extract_from_db）可省略 request
 CASE_SCHEMA = {
     "type": "object",
-    "required": ["name", "request"],
+    "required": ["name"],
+    "anyOf": [
+        {"required": ["request"]},
+        {"required": ["db_assertions"]},
+        {"required": ["db_setup"]},
+        {"required": ["extract_from_db"]},
+    ],
     "properties": {
         "name": {"type": "string"},
         "description": {"type": "string"},
@@ -58,6 +65,26 @@ CASE_SCHEMA = {
             },
         },
         "extract": {"type": "object", "additionalProperties": {"type": "string"}},
+        # ---- 数据库扩展 ----
+        "db_setup": {"type": "array", "items": {"type": ["string", "object"]}},
+        "db_teardown": {"type": "array", "items": {"type": ["string", "object"]}},
+        "db_assertions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["sql"],
+                "properties": {
+                    "sql": {"type": "string"},
+                    # row_count: 行数 | value: 单值(默认) | contains_row: 查询结果包含
+                    "type": {"type": "string"},
+                    "op": {"type": "string"},
+                    "expected": {},
+                    "column": {"type": "string"},
+                    "message": {"type": "string"},
+                },
+            },
+        },
+        "extract_from_db": {"type": "object", "additionalProperties": {"type": "string"}},
     },
 }
 

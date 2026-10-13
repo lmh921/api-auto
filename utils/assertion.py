@@ -14,6 +14,17 @@ def _compile_jsonpath(expression: str):
 class Assertion:
     """断言模块"""
 
+    # DB校验比较符 -> 断言方法
+    OP_METHODS = {
+        "==": "assert_equal",
+        "!=": "assert_not_equal",
+        ">": "assert_greater_than",
+        ">=": "assert_greater_or_equal",
+        "<": "assert_less_than",
+        "<=": "assert_less_or_equal",
+    }
+    DB_ASSERT_TYPES = ("row_count", "value", "contains_row")
+
     def __init__(self):
         pass
 
@@ -163,3 +174,65 @@ class Assertion:
             )
             raise AssertionError(summary)
         logger.info(f"全部 {len(assertions)} 条断言通过")
+
+    def _query_db_actual(self, db_client, spec: Dict[str, Any]) -> Any:
+        """执行DB校验的查询并取出实际值（根据校验类型）"""
+        atype = spec.get("type", "value")
+        sql = spec["sql"]
+        rows = db_client.query_all(sql)
+
+        if atype == "row_count":
+            return len(rows)
+
+        if not rows:
+            raise AssertionError(f"DB校验失败: SQL未查询到数据: {sql}")
+
+        column = spec.get("column")
+        if atype == "value":
+            col_name = column or next(iter(rows[0]))
+            if col_name not in rows[0]:
+                raise AssertionError(f"DB校验失败: 查询结果中不存在列 {col_name}，实际列: {list(rows[0])}")
+            return rows[0][col_name]
+
+        if atype == "contains_row":
+            return [row.get(column) for row in rows] if column else rows
+
+        raise AssertionError(f"不支持的DB校验类型: {atype}（支持: {', '.join(self.DB_ASSERT_TYPES)}）")
+
+    def run_db_assertions(self, db_client, db_assertions: List[Dict[str, Any]]) -> None:
+        """运行数据库校验（软断言，与 run_assertions 同风格：全部执行后一次性汇总失败）
+
+        校验类型:
+        - row_count: 查询行数与期望值按 op 比较（op默认==）
+        - value:     首行指定列（默认第一列）的值与期望值按 op 比较
+        - contains_row: 查询结果（或指定列的值列表）包含期望值
+        """
+        if not db_assertions:
+            return
+
+        failures: List[str] = []
+        for index, spec in enumerate(db_assertions, 1):
+            message = spec.get("message", f"第{index}条DB校验")
+            try:
+                actual = self._query_db_actual(db_client, spec)
+                if spec.get("type") == "contains_row":
+                    method = "assert_contains"
+                else:
+                    op = spec.get("op", "==")
+                    method = self.OP_METHODS.get(op)
+                    if not method:
+                        raise AssertionError(f"不支持的比较符: {op}（支持: {', '.join(self.OP_METHODS)}）")
+                getattr(self, method)(actual, spec.get("expected"), message)
+            except AssertionError as e:
+                logger.error(f"DB校验失败: {e}")
+                failures.append(str(e))
+            except Exception as e:
+                logger.error(f"DB校验执行异常: {message} {type(e).__name__}: {e}")
+                failures.append(f"{message} DB校验执行异常: {type(e).__name__}: {e}")
+
+        if failures:
+            summary = f"共 {len(db_assertions)} 条DB校验，失败 {len(failures)} 条:\n" + "\n".join(
+                f"  {i}. {item}" for i, item in enumerate(failures, 1)
+            )
+            raise AssertionError(summary)
+        logger.info(f"全部 {len(db_assertions)} 条DB校验通过")

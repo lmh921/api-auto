@@ -115,6 +115,29 @@ class Config:
             result[key] = value
         return result
 
+    @property
+    def db_config(self) -> Dict[str, Any]:
+        """数据库连接配置：优先取环境配置的 db 段，回退到顶层 db 段；无配置返回空字典
+
+        值支持 $ENV{NAME} 引用环境变量（如密码外部化），环境变量未设置时该键不生效
+        """
+        db = self.env_config.get("db") or self.raw.get("db")
+        if not db:
+            return {}
+        result: Dict[str, Any] = {}
+        for key, value in db.items():
+            if isinstance(value, str):
+                match = _ENV_VAR_PATTERN.fullmatch(value.strip())
+                if match:
+                    env_value = os.environ.get(match.group(1))
+                    if env_value is None:
+                        logger.warning(f"环境变量 {match.group(1)} 未设置，数据库配置 {key} 不生效")
+                        continue
+                    result[key] = env_value
+                    continue
+            result[key] = value
+        return result
+
 
 _config: Optional[Config] = None
 

@@ -105,6 +105,21 @@ def assertion():
     """断言器fixture"""
     return Assertion()
 
+@pytest.fixture(scope="function")
+def db_client():
+    """数据库客户端fixture（function作用域：用例级连接，用完即关）
+
+    环境未配置 db 段时返回 None，用例若使用了 db_* 字段会在执行时给出明确报错
+    """
+    db_config = get_config().db_config
+    if not db_config:
+        yield None
+        return
+    from utils.db_client import DBClient
+    client = DBClient(db_config)
+    yield client
+    client.close()
+
 @pytest.fixture(scope="session", autouse=True)
 def clear_allure_results():
     """自动清理Allure报告结果目录"""

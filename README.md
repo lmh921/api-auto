@@ -14,6 +14,7 @@
 - **文件级setup**：登录等前置步骤写一次，同一文件所有用例复用
 - **自动生成报告**：集成Allure生成美观的测试报告，敏感信息自动脱敏
 - **完善的日志记录**：使用Loguru记录详细的测试过程
+- **接口+数据库双校验**：支持用例级 db_setup 造数、db_assertions 落库校验（行数/单值/包含，软断言）、extract_from_db 提取、db_teardown 清理，支持 MySQL（pymysql）与 SQLite（内置）
 - **易于扩展**：模块化设计，方便扩展新功能
 
 ## 2. 技术栈
@@ -47,6 +48,7 @@ ziufileApi/
 │   ├── step_runner.py      # 步骤执行（env覆盖+文件上传）
 │   ├── setup_runner.py     # 文件级前置步骤
 │   ├── masking.py          # 敏感信息脱敏
+│   ├── db_client.py        # 数据库客户端（MySQL/SQLite，用例级连接）
 │   └── result_summary.py   # 测试结果摘要（CI邮件正文/附件生成）
 ├── conftest.py             # Pytest配置（--env参数+用例参数化）
 ├── pytest.ini              # Pytest配置
@@ -355,6 +357,75 @@ JSONPath底层基于 `jsonpath-ng` 实现，`$` 前缀可以省略：
 - `$length`：响应体长度（常用于列表数量断言）
 
 匹配到单个值时返回该值；匹配到多个值时返回列表；匹配不到时该条断言失败。
+
+### 6.9 数据库连接与校验
+
+框架支持在用例中直接操作数据库：前置造数（`db_setup`）、数据落库校验（`db_assertions`）、库内变量提取（`extract_from_db`）、清理（`db_teardown`），适用于"接口调用后校验数据是否正确落库"等场景。
+
+**第一步：环境配置**（`config/config.yaml` 环境下增加 `db` 段，密码支持 `$ENV{DB_PASSWORD}` 外部化）：
+
+```yaml
+environments:
+  client-dev:
+    base_url: "https://..."
+    caseData_path: "data/client_data"
+    db:
+      driver: mysql            # mysql / sqlite
+      host: "127.0.0.1"
+      port: 3306
+      user: "test_rw"
+      password: "$ENV{DB_PASSWORD}"   # 敏感信息外部化到环境变量
+      database: "client_dev"
+      charset: "utf8mb4"
+```
+
+`driver: sqlite` 时只需 `path` 一个参数（Python 内置驱动，零依赖，适合演示/离线验证）。mysql 驱动需安装 `pip install pymysql`（已在 requirements.txt）。
+
+**第二步：用例中编写 DB 步骤**：
+
+```yaml
+testcases:
+  - name: "创建用户后校验落库"
+    request:                       # 接口调用（纯数据库用例可省略 request）
+      method: "POST"
+      url: "/user/create"
+      json: { mobile: "${test_mobile}" }
+    extract:
+      new_user_id: "data.id"
+
+    db_setup:                      # 前置：请求前执行（建表/造数），支持 ${var}
+      - "DELETE FROM t_user WHERE mobile = '${test_mobile}'"
+
+    db_assertions:                 # 请求后执行的数据校验（软断言，失败汇总）
+      - type: "row_count"          # 行数校验
+        sql: "SELECT id FROM t_user WHERE mobile = '${test_mobile}'"
+        op: ">="                   # 支持 == != > >= < <=
+        expected: 1
+        message: "用户应落库"
+      - type: "value"              # 单值校验（默认取首行第一列，可用 column 指定列名）
+        sql: "SELECT status FROM t_user WHERE mobile = '${test_mobile}'"
+        expected: "active"
+        message: "用户状态应为active"
+      - type: "contains_row"       # 查询结果包含（整行字典列表 或 column 指定列的值列表）
+        sql: "SELECT role FROM t_user WHERE mobile = '${test_mobile}'"
+        column: "role"
+        expected: "admin"
+
+    extract_from_db:               # 从库中提取变量（取首行首列），后续用例可用 ${db_user_id}
+      db_user_id: "SELECT id FROM t_user WHERE mobile = '${test_mobile}'"
+
+    db_teardown:                   # 清理：无论断言成败都执行，防止数据残留
+      - "DELETE FROM t_user WHERE mobile = '${test_mobile}'"
+```
+
+**规则说明**：
+
+- 执行顺序：文件setup → `db_setup` → 请求（可选）→ 接口断言（可选）→ `db_assertions` → `extract` / `extract_from_db` → `finally: db_teardown`；
+- **时序**：`db_setup` 在请求之前执行，若需要引用接口返回的变量（如落库校验），请拆成两条用例跨用例传参（参考 `data/client_data/db_demo_test.yaml`）；
+- 所有 SQL 均支持 `${var}` 变量替换；`db_assertions` 的 `expected` 整串占位符保留原始类型；
+- 环境未配置 `db` 段时，用例使用了 db_* 字段会直接失败并提示补充配置；
+- 连接为用例级生命周期（每条用例独立连接，用完即关）；
+- 离线演示：`data/client_data/db_demo_test.yaml`（sqlite 驱动），`python run_test.py -e client-dev` 可直接运行。
 
 ## 7. 运行测试
 

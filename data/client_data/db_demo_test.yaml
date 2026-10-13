@@ -1,0 +1,79 @@
+# 数据库校验演示用例（sqlite内置驱动，离线可跑，验证框架的 db_* 能力）
+# 演示内容：接口提取变量 -> 下一条用例db_setup落库 -> db_assertions校验 -> extract_from_db回读 -> db_teardown清理
+# 注意时序：db_setup 在请求之前执行，若需引用上游接口的变量，请拆成跨用例传参（如本文件用例1->用例2）
+# 接入真实项目时可将本文件作为模板，驱动换成 mysql（见 config.yaml 的 db 段注释与README 6.9节）
+description: "数据库连接与校验能力演示：API数据落库校验 + 纯数据库校验用例"
+tags: ["数据库", "演示"]
+
+testcases:
+  # 用例1：调接口提取变量（供用例2的db_setup使用）
+  - name: "接口提取用户名"
+    description: "调公共API提取用户名，模拟业务接口返回数据"
+    tags: ["GET", "API+DB"]
+    env:
+      base_url: "https://jsonplaceholder.typicode.com"   # 用例级env覆盖（离线演示接口）
+    request:
+      method: "GET"
+      url: "/users/1"
+    assertions:
+      - type: "status_code"
+        expected: 200
+        message: "接口状态码"
+    extract:
+      api_user_name: "name"
+
+  # 用例2：接口数据落库校验（模拟"接口创建的数据应正确落库"）
+  - name: "接口数据落库校验"
+    description: "把接口提取的用户名写入sqlite，校验落库结果一致，最后清理"
+    tags: ["DB"]
+    db_setup:   # 前置：建表 + 写入接口数据（真实项目中通常是接口自己落库，这里演示能力）
+      - "CREATE TABLE IF NOT EXISTS demo_users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, tag TEXT)"
+      - "INSERT INTO demo_users(name, tag) VALUES ('${api_user_name}', 'auto_demo')"
+
+    db_assertions:
+      - type: "row_count"
+        sql: "SELECT id FROM demo_users WHERE tag = 'auto_demo'"
+        op: ">="
+        expected: 1
+        message: "接口数据应落库"
+      - type: "value"
+        sql: "SELECT name FROM demo_users WHERE tag = 'auto_demo'"
+        expected: "${api_user_name}"     # 整串占位符保留原始类型
+        message: "落库name与接口返回一致"
+      - type: "contains_row"
+        sql: "SELECT name FROM demo_users WHERE tag = 'auto_demo'"
+        column: "name"
+        expected: "${api_user_name}"
+        message: "查询结果包含接口用户名"
+
+    extract_from_db:
+      demo_user_id: "SELECT id FROM demo_users WHERE tag = 'auto_demo'"
+
+    db_teardown:   # 清理：无论断言成败都执行，数据不残留
+      - "DELETE FROM demo_users WHERE tag = 'auto_demo'"
+      - "DROP TABLE demo_users"
+
+  # 用例3：纯数据库校验用例（无request，校验数据口径/存储过程结果等场景）
+  - name: "纯数据库校验用例"
+    description: "不发起任何接口请求，仅做库内数据准备、校验与清理"
+    tags: ["DB"]
+    db_setup:
+      - "CREATE TABLE IF NOT EXISTS demo_counter (n INTEGER)"
+      - "INSERT INTO demo_counter(n) VALUES (1)"
+      - "INSERT INTO demo_counter(n) VALUES (2)"
+    db_assertions:
+      - type: "row_count"
+        sql: "SELECT n FROM demo_counter"
+        op: "=="
+        expected: 2
+        message: "计数表应有2行"
+      - type: "value"
+        sql: "SELECT MAX(n) AS max_n FROM demo_counter"
+        column: "max_n"
+        op: "=="
+        expected: 2
+        message: "最大值应为2"
+    extract_from_db:
+      max_n: "SELECT MAX(n) AS max_n FROM demo_counter"
+    db_teardown:
+      - "DROP TABLE demo_counter"

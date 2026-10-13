@@ -15,3 +15,6 @@ reports/
 # 系统文件
 Thumbs.db
 .DS_Store
+
+# 数据库演示文件
+data/*.sqlite

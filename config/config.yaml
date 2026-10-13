@@ -14,6 +14,19 @@ environments:
   client-dev:
     base_url: "https://www.ziulife.com/client-api-dev/client"
     caseData_path: "data/client_data"
+    # 数据库连接（驱动: mysql / sqlite；密码支持 $ENV{DB_PASSWORD} 外部化）
+    # 当前为 sqlite 演示配置（离线可跑），接入真实数据库时换成 mysql 段（见README 6.9节）:
+    # db:
+    #   driver: mysql
+    #   host: "127.0.0.1"
+    #   port: 3306
+    #   user: "test_rw"
+    #   password: "$ENV{DB_PASSWORD}"
+    #   database: "client_dev"
+    #   charset: "utf8mb4"
+    db:
+      driver: sqlite
+      path: "data/db_demo.sqlite"
   client-prod:
     base_url: "https://www.ziulife.com/client-api-prod/client"
     caseData_path: "data/client_data"
