@@ -32,13 +32,13 @@
 ziufileApi/
 ├── config/                  # 配置文件目录
 │   └── config.yaml         # 全局配置文件（多环境定义）
-├── data/                   # 测试用例数据目录
-│   ├── client_data/        # 客户端测试用例
-│   └── station_data/       # 驿站端测试用例
+├── data/                   # 真实业务测试用例目录（由 config.yaml 的 caseData_path 指向）
+│   ├── client_data/        # 客户端测试用例（client-* 环境执行）
+│   └── station_data/       # 驿站端测试用例（station-* 环境执行）
 ├── logs/                   # 日志文件目录
 ├── reports/                # 测试报告目录
-├── testcases/              # 测试执行器目录
-│   └── test_executor.py    # 测试执行器
+├── testcases/              # Pytest Python 执行入口 + 用例模板/示例
+│   └── test_executor.py    # 唯一的 Python 测试函数，将 data/ 下的 YAML 用例参数化执行
 ├── utils/                  # 工具类目录
 │   ├── http_client.py      # HTTP客户端（重试策略）
 │   ├── yaml_parser.py      # YAML解析器（变量替换）
@@ -186,7 +186,11 @@ addopts = -v -s --alluredir=reports/allure-results
 
 ### 6.1 测试用例格式
 
-测试用例采用YAML格式编写，存放在`testcases`目录下，以`.yaml`为后缀（模板文件除外）。
+测试用例采用YAML格式编写，**存放在 `config.yaml` 中各环境 `caseData_path` 指定的目录下**（默认 `data/client_data` 与 `data/station_data`），以 `.yaml` 为后缀（模板文件除外）。
+
+> ⚠️ 注意区分两个目录：
+> - `data/*_data/`：**真实业务测试用例**所在目录，由 `case_collector.py` 按 `caseData_path` 递归扫描。
+> - `testcases/`：存放 Pytest 的 Python 执行入口 `test_executor.py` 。框架通过 `test_executor.py` 这个唯一的 Python 测试函数，把 `data/` 下的每条 YAML 用例参数化为独立的 Pytest 用例来执行。
 
 ### 6.2 单接口测试用例示例
 
@@ -425,7 +429,7 @@ testcases:
 - 所有 SQL 均支持 `${var}` 变量替换；`db_assertions` 的 `expected` 整串占位符保留原始类型；
 - 环境未配置 `db` 段时，用例使用了 db_* 字段会直接失败并提示补充配置；
 - 连接为用例级生命周期（每条用例独立连接，用完即关）；
-- 离线演示：`data/client_data/db_demo_test.yaml`（sqlite 驱动），`python run_test.py -e client-dev` 可直接运行。
+- 离线演示：`data/case_template/db_demo_test.yaml`（sqlite 驱动），`python run_test.py -e client-dev` 可直接运行。
 
 ## 7. 运行测试
 

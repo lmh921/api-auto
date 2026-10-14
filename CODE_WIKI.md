@@ -1,6 +1,6 @@
 # Code Wiki · ziufileApi 接口自动化测试框架
 
-> 版本：v1.0 · 更新时间：2026-10-10
+> 版本：v1.1 · 更新时间：2026-10-14
 > 项目路径：`d:\pythontest\ziufileApi`
 
 ---
@@ -20,6 +20,7 @@
    - 4.7 [setup_runner · 文件级前置执行器](#47-setup_runnerpy-文件级前置执行器)
    - 4.8 [masking · 敏感信息脱敏](#48-maskingpy-敏感信息脱敏)
    - 4.9 [result_summary · 测试结果摘要](#49-result_summarypy-测试结果摘要)
+   - 4.10 [db_client · 数据库客户端](#410-db_clientpy-数据库客户端)
 5. [入口与执行层](#5-入口与执行层)
    - 5.1 [conftest.py · Pytest 配置与 Fixtures](#51-conftestpy-pytest-配置与-fixtures)
    - 5.2 [test_executor.py · 用例执行主体](#52-test_executorpy-用例执行主体)
@@ -42,6 +43,7 @@
    - 8.5 [文件上传 files](#85-文件上传-files)
    - 8.6 [断言类型一览](#86-断言类型一览)
    - 8.7 [JSONPath 语法](#87-jsonpath-语法)
+   - 8.8 [数据库连接与校验](#88-数据库连接与校验)
 9. [项目运行方式](#9-项目运行方式)
    - 9.1 [环境准备](#91-环境准备)
    - 9.2 [本地运行](#92-本地运行)
@@ -75,6 +77,7 @@
 | JSONPath | 基于 jsonpath-ng，`$` 前缀可省略，支持 `$length` 扩展 |
 | 用例结构校验 | YAML 结构不合规生成显式失败用例而非静默跳过 |
 | Marker 支持 | 用例 tags 自动映射 pytest marker，`-m smoke` 圈选用例 |
+| **数据库断言** | 支持 `db_setup` / `db_assertions` / `extract_from_db` / `db_teardown`，MySQL + SQLite 双驱动，用例级连接生命周期 |
 
 ### 1.2 技术栈
 
@@ -168,7 +171,7 @@ ziufileApi/
 │   └── config.yaml                 # 多环境定义、超时重试、预置变量、日志与Allure
 │
 ├── data/                           # 真实业务测试用例（按环境 caseData_path 加载）
-│   └── _archived_ziulife/          # 旧产品归档用例（当前目录演示用）
+│   └───├── case_template/          # 模板用例（当前目录演示用）
 │       ├── client_data/            # 客户端侧用例：login / selectUser / delUser ...
 │       └── station_data/           # 驿站侧用例
 │
@@ -188,16 +191,17 @@ ziufileApi/
 │   ├── multi_case_template.yaml    # 多接口用例模板（含全局变量注释）
 │   └── single_case_template.yaml   # 单接口用例模板
 │
-├── utils/                          # 核心模块（9 个子模块）
-│   ├── config.py                   # 全局配置：多环境/正式环境保护/预置变量
+├── utils/                          # 核心模块（10 个子模块）
+│   ├── config.py                   # 全局配置：多环境/正式环境保护/预置变量/DB配置
 │   ├── http_client.py              # HTTP 客户端：幂等重试策略
 │   ├── yaml_parser.py              # YAML 解析 + ${var} 变量替换（保留类型）
-│   ├── assertion.py                # 软断言 + JSONPath 取值引擎
+│   ├── assertion.py                # 软断言 + JSONPath 取值引擎 + DB断言
 │   ├── case_collector.py           # 用例发现 / jsonschema 校验 / setup 注册 / 用例ID
 │   ├── step_runner.py              # 单步骤准备-发送-清理三件套
 │   ├── setup_runner.py             # 文件级 setup 执行 + 跨文件缓存
 │   ├── masking.py                  # 三层脱敏：字典/Repr/文本替换
-│   └── result_summary.py           # Allure 结果 → 邮件正文+HTML附件
+│   ├── result_summary.py           # Allure 结果 → 邮件正文+HTML附件
+│   └── db_client.py                # 数据库客户端（MySQL/SQLite，用例级连接）
 │
 ├── conftest.py                     # Pytest 入口：参数化 + Fixtures + 日志脱敏
 ├── pytest.ini                      # Pytest 静态配置：markers / addopts / testpaths
@@ -251,6 +255,7 @@ ziufileApi/
 | `log_config` | `dict` | raw.log | Loguru 配置 |
 | `allure_config` | `dict` | raw.allure | Allure 配置 |
 | `variables` | `dict` | raw.variables | 预置变量（含 `$ENV{}` 展开） |
+| `db_config` | `dict` | env_config.db > raw.db | 数据库连接配置（支持 `$ENV{NAME}` 展开密码等）；无配置返回空 dict |
 
 #### 预置变量 `$ENV{}` 展开规则
 
@@ -368,6 +373,7 @@ url: "/users/${undefined_var}"     # → "/users/${undefined_var}"
 
 - 基于 jsonpath-ng 的响应体取值引擎
 - 8 种断言方法 + 状态码断言 + **软断言汇总**
+- **数据库断言**（`run_db_assertions`）：行数 / 单值 / 包含行 三种校验，复用比较符映射表
 - JSONPath 表达式 LRU 缓存（`_compile_jsonpath`，maxsize=256）
 - 兼容无 `$` 前缀的 JSONPath 写法
 - 扩展 `$length` 路径：返回数组/字典/字符串长度
@@ -430,6 +436,32 @@ def run_assertions(self, response, assertions) -> None:
   2. 检查用户名 断言失败: 实际值 'a' 不包含 'b'
 ```
 
+##### 常量与比较符映射
+
+| 常量 | 内容 | 说明 |
+|------|------|------|
+| `OP_METHODS` | `{"==": assert_equal, "!=": assert_not_equal, ">": assert_greater_than, ">=": assert_greater_or_equal, "<": assert_less_than, "<=": assert_less_or_equal}` | DB 断言用，把 YAML 的 `op` 字符串映射到内部断言方法 |
+| `DB_ASSERT_TYPES` | `("row_count", "value", "contains_row")` | 支持的 DB 校验类型 |
+
+##### 数据库断言 `run_db_assertions`
+
+```python
+def run_db_assertions(self, db_client, db_assertions: List[Dict]) -> None:
+```
+
+与 `run_assertions` 同风格的**软断言**：全部执行后一次性汇总失败项。
+
+**三种校验类型**：
+
+| type | 实际值来源 | 比较方式 | 典型字段 |
+|------|-----------|---------|---------|
+| `row_count` | SQL 查询结果的**行数**（`len(rows)`） | 按 `op`（默认 `==`）与 `expected` 比较 | `sql`, `op`, `expected` |
+| `value` | 首行指定列的值（`column` 缺省取第一列） | 按 `op` 与 `expected` 比较 | `sql`, `column`, `op`, `expected` |
+| `contains_row` | 查询结果列表（或 `column` 指定列的值列表） | 调用 `assert_contains` 检查 `expected` 在列表中 | `sql`, `column`, `expected` |
+
+> 查询 0 行时：`row_count` 返回 0；`value` / `contains_row` 直接失败（`SQL未查询到数据`）。
+> `value` 类型若 `column` 不存在于查询结果，会失败并提示实际列名。
+
 ---
 
 ### 4.5 case_collector.py · 用例收集器
@@ -449,7 +481,7 @@ def run_assertions(self, response, assertions) -> None:
 | 名称 | 类型 | 说明 |
 |------|------|------|
 | `FILE_SETUPS` | `Dict[str, dict]` | 全局注册表：`rel_path → {cache, steps}` |
-| `CASE_SCHEMA` | JSON Schema | 要求 `name` + `request(method,url)`；允许 `tags/env/assertions/extract` |
+| `CASE_SCHEMA` | JSON Schema | 要求 `name` + 以下四选一：`request` / `db_assertions` / `db_setup` / `extract_from_db`（纯数据库校验用例可省略 request）；允许 `tags/env/assertions/extract/db_setup/db_teardown/db_assertions/extract_from_db` |
 | `SETUP_SCHEMA` | JSON Schema | 要求 `steps[]`；可选 `cache: bool` |
 
 #### 关键函数
@@ -608,6 +640,46 @@ files:
 
 ---
 
+### 4.10 db_client.py · 数据库客户端
+
+**文件**：[utils/db_client.py](file:///d:/pythontest/ziufileApi/utils/db_client.py)
+
+#### 职责
+
+- 基于 DB-API 2.0 的轻量数据库封装，支持 **MySQL**（pymysql）和 **SQLite**（内置 sqlite3）
+- **用例级连接生命周期**：由 conftest 的 `db_client` fixture 管理，每条用例独立连接、用完即关
+- 懒连接：首次执行 SQL 时才建立连接，未使用 DB 功能的用例不建立连接
+- 统一结果格式：查询返回 `List[Dict[列名, 值]]`，便于断言与调试
+- 连接配置来自 `config.yaml` 环境段的 `db` 段，密码支持 `$ENV{NAME}` 外部化
+
+#### 支持的驱动
+
+| driver | 依赖 | 配置项 | 说明 |
+|--------|------|--------|------|
+| `mysql` | `pip install pymysql`（已在 requirements） | `host`, `port`, `user`, `password`, `database`, `charset`, `connect_timeout` | 默认 127.0.0.1:3306，charset=utf8mb4，使用 DictCursor |
+| `sqlite` | Python 内置，零依赖 | `path`（相对路径按项目根解析） | 适合演示与离线验证 |
+
+#### 关键类 `DBClient`
+
+| 方法 | 签名 | 说明 |
+|------|------|------|
+| `__init__(db_config)` | `(Dict) -> DBClient` | 校验 driver；不立即建连 |
+| `_connect()` | `() -> Connection` | 懒连接内部方法；按 driver 分支建立连接 |
+| `query_all(sql)` | `(str) -> List[Dict]` | 执行查询，返回行列表（每行 `{列名: 值}`） |
+| `query_value(sql)` | `(str) -> Optional[Any]` | 返回首行首列的标量值；无结果返回 None |
+| `execute(sql)` | `(str) -> int` | 执行 DDL/DML 并提交，返回受影响行数（用 `cursor.rowcount` 兼容不同驱动返回值差异） |
+| `close()` | `() -> None` | 关闭连接（多次调用安全） |
+
+#### 常量
+
+| 常量 | 值 | 说明 |
+|------|----|------|
+| `SUPPORTED_DRIVERS` | `("mysql", "sqlite")` | 非法驱动抛 `ValueError` |
+
+> 设计要点：`execute()` 不直接返回 `cursor.execute()` 的结果（sqlite3 返回 cursor 自身、pymysql 返回 int，DB-API 不统一），统一取 `cursor.rowcount`。
+
+---
+
 ## 5. 入口与执行层
 
 ### 5.1 conftest.py · Pytest 配置与 Fixtures
@@ -630,6 +702,7 @@ files:
 | `http_client` | **function** | 每个用例独立实例，避免 case 级 `env` 覆盖相互污染；结束自动 `session.close()` |
 | `yaml_parser` | function | YamlParser 实例 |
 | `assertion` | function | Assertion 实例 |
+| `db_client` | **function** | 数据库客户端；环境未配置 `db` 段时返回 `None`，用例若使用了 `db_*` 字段会在执行时明确报错；配置后每条用例独立 `DBClient` 实例，结束自动 `close()` |
 | `clear_allure_results` | session / autouse | 按 allure.clean 开关清理 `reports/allure-results/*` |
 
 ---
@@ -638,7 +711,9 @@ files:
 
 **文件**：[testcases/test_executor.py](file:///d:/pythontest/ziufileApi/testcases/test_executor.py)
 
-#### `test_api_executor(case_file, case, yaml_parser, http_client, assertion, global_vars)`
+#### `test_api_executor(case_file, case, yaml_parser, http_client, assertion, global_vars, db_client)`
+
+**执行顺序**：文件级 setup → `db_setup` → 请求(可选) → 接口断言(可选) → `db_assertions` → `extract` / `extract_from_db` → `finally: db_teardown`
 
 **执行流程**（每条参数化用例走一次）：
 
@@ -653,23 +728,33 @@ files:
      → setup_runner.ensure_setup(...)
      → 失败则 pytest.fail（同文件后续用例直接命中 _setup_failed 缓存）
 3. 断言期望值变量替换：assertions = replace_variables(case.assertions, global_vars)
-4. prepare_step(case) 组装请求
+4. db_setup（可选）：_require_db 检查 → 逐条 SQL 执行（支持 ${var}），attach SQL 与影响行数
 5. try:
-     allure.step("发送请求") →
-       attach 脱敏请求参数 JSON
-       response = send_prepared(...)
-       attach 状态码 / 脱敏响应体 JSON
-   finally: cleanup_step（确保文件句柄关闭、env 恢复）
-6. allure.step("执行断言") → assertion.run_assertions（软断言）
-7. case.extract 存在时：
+     请求(可选，纯 DB 用例可无 request)：
+       allure.step("发送请求") →
+         attach 脱敏请求参数 JSON
+         response = send_prepared(...)
+         attach 状态码 / 脱敏响应体 JSON
+       finally: cleanup_step（确保文件句柄关闭、env 恢复）
+6. 接口断言（可选）→ assertion.run_assertions（软断言）
+7. db_assertions（可选）：_require_db 检查 → assertion.run_db_assertions（软断言）
+     → 每条校验 SQL 的查询结果脱敏后 attach 到 Allure
+8. extract（可选，需 response 非空）：
      allure.step("提取变量")
        for var_name, jsonpath:
            global_vars[var_name] = 取值
            register_extracted（敏感键注册到文本替换）
            log & attach 脱敏后的 key=value
+9. extract_from_db（可选）：_require_db 检查 → 每条 SQL 取首行首列写入 global_vars
+10. finally: db_teardown（可选）：无论断言成败都执行，防止数据残留
+     → 清理失败记录 teardown_error，最终 pytest.fail 提示数据可能残留
 ```
 
-> 设计要点：`try-finally` 包 request + cleanup，确保任何异常（断言失败、网络错误）下文件句柄不泄漏，env 覆盖总能恢复。
+> 设计要点：
+> - `_require_db`：环境未配置 `db` 段时，使用了 `db_*` 字段的用例立即 `pytest.fail` 并给出补充配置的明确指引。
+> - `db_setup` 用独立 try（不在大 try 内）：前置造数失败应直接终止用例，不进入请求阶段。
+> - `db_teardown` 在 finally 中执行，且清理失败不吞掉原始断言失败（用 `teardown_error` 单独记录，原始异常继续传播）。
+> - 纯数据库校验用例可省略 `request` 字段，此时 `response=None`，`extract` 自动跳过。
 
 ---
 
@@ -746,6 +831,7 @@ files:
 | `loguru` | 最新 | 结构化日志；支持 patcher（脱敏注入） | 所有 .py 模块 |
 | `jsonschema` | 最新 | 校验 YAML 用例/setup 结构合规性 | case_collector.py |
 | `jsonpath-ng` | 最新 | JSONPath 取值引擎（支持 find + compile） | assertion.py |
+| `pymysql` | 最新 | MySQL 驱动（仅当 `driver: mysql` 时使用，懒加载 import） | db_client.py |
 
 ### 6.2 内部模块依赖图
 
@@ -783,6 +869,8 @@ setup_runner  assertion.py  test_executor
     run_test.py  →  pytest.main()  →  test_executor
 
 result_summary.py   ← 独立模块，直接读 allure-results JSON
+
+db_client.py        ← 仅依赖 config.PROJECT_ROOT；被 conftest / test_executor 通过 fixture 注入
 ```
 
 **依赖表（谁 import 谁）**：
@@ -798,7 +886,8 @@ result_summary.py   ← 独立模块，直接读 allure-results JSON
 | step_runner.py | config.PROJECT_ROOT；yaml_parser.YamlParser |
 | setup_runner.py | case_collector.FILE_SETUPS；config.PROJECT_ROOT；masking（mask_data/register_extracted）；step_runner（全部） |
 | result_summary.py | （无；标准库 argparse/json/html/pathlib） |
-| conftest.py | utils.http_client / yaml_parser / assertion / config / case_collector / masking |
+| db_client.py | config.PROJECT_ROOT；pymysql（懒加载，仅 mysql 驱动） |
+| conftest.py | utils.http_client / yaml_parser / assertion / config / case_collector / masking / db_client（懒加载） |
 | testcases/test_executor.py | utils.setup_runner / config / masking / step_runner |
 | run_test.py | （调用 pytest.main；无直接 import utils） |
 | debug_test.py | utils.yaml_parser / http_client / assertion / config |
@@ -819,6 +908,14 @@ environments:
   client-dev:
     base_url: "https://www.ziulife.com/client-api-dev/client"
     caseData_path: "data/client_data"
+    db:                              # 可选：数据库连接配置（无则用例的 db_* 字段会失败并提示）
+      driver: mysql                  # mysql / sqlite
+      host: "127.0.0.1"
+      port: 3306
+      user: "test_rw"
+      password: "$ENV{DB_PASSWORD}"  # 敏感信息外部化到环境变量
+      database: "client_dev"
+      charset: "utf8mb4"
   client-prod:
     base_url: "https://www.ziulife.com/client-api-prod/client"
     caseData_path: "data/client_data"
@@ -847,6 +944,12 @@ allure:
   report_dir: "reports/allure-results"
   clean: true
 ```
+
+> **db 段说明**：
+> - `driver: sqlite` 时只需 `path` 一个参数（Python 内置驱动，零依赖，适合演示/离线验证），相对路径按项目根解析。
+> - `driver: mysql` 时需安装 `pymysql`（已在 requirements.txt）。
+> - 密码等敏感值支持 `$ENV{NAME}` 引用系统环境变量，未设置时该键不生效并打 WARNING 日志。
+> - 环境未配置 `db` 段时，用例若使用了 `db_setup`/`db_assertions`/`extract_from_db`/`db_teardown` 字段，会在执行时 `pytest.fail` 并提示补充配置。
 
 **环境选择优先级（高→低）**：
 1. CLI：`pytest --env station-dev` 或 `python run_test.py -e station-dev`
@@ -1006,6 +1109,96 @@ files:
 | `$length` / `length` | 数组/字典/字符串长度（扩展语法） |
 
 匹配 0 项 → 断言失败；1 项 → 返回该值；多项 → 返回列表，与 `expected` 比较。
+
+### 8.8 数据库连接与校验
+
+框架支持在用例中直接操作数据库，适用于"接口调用后校验数据是否正确落库"、"前置造数"、"清理测试数据"等场景。
+
+#### 第一步：环境配置
+
+在 `config/config.yaml` 对应环境下增加 `db` 段（密码建议用 `$ENV{}` 外部化）：
+
+```yaml
+environments:
+  client-dev:
+    base_url: "https://..."
+    caseData_path: "data/client_data"
+    db:
+      driver: mysql                  # mysql / sqlite
+      host: "127.0.0.1"
+      port: 3306
+      user: "test_rw"
+      password: "$ENV{DB_PASSWORD}"  # 敏感信息外部化
+      database: "client_dev"
+      charset: "utf8mb4"
+```
+
+- `driver: sqlite`：只需 `path` 参数（Python 内置驱动，零依赖，适合演示/离线验证）。
+- `driver: mysql`：需安装 `pymysql`（已在 requirements.txt）。
+
+#### 第二步：用例中编写 DB 步骤
+
+```yaml
+testcases:
+  - name: "创建用户后校验落库"
+    request:                          # 接口调用（纯数据库用例可省略 request）
+      method: "POST"
+      url: "/user/create"
+      json: { mobile: "${test_mobile}" }
+    extract:
+      new_user_id: "data.id"
+
+    db_setup:                         # 前置：请求前执行（建表/造数），支持 ${var}
+      - "DELETE FROM t_user WHERE mobile = '${test_mobile}'"
+
+    db_assertions:                    # 请求后执行的数据校验（软断言，失败汇总）
+      - type: "row_count"             # 行数校验
+        sql: "SELECT id FROM t_user WHERE mobile = '${test_mobile}'"
+        op: ">="                      # 支持 == != > >= < <=
+        expected: 1
+        message: "用户应落库"
+      - type: "value"                 # 单值校验（默认取首行第一列，可用 column 指定列名）
+        sql: "SELECT status FROM t_user WHERE mobile = '${test_mobile}'"
+        expected: "active"
+        message: "用户状态应为active"
+      - type: "contains_row"          # 查询结果包含（整行字典列表 或 column 指定列的值列表）
+        sql: "SELECT role FROM t_user WHERE mobile = '${test_mobile}'"
+        column: "role"
+        expected: "admin"
+
+    extract_from_db:                  # 从库中提取变量（取首行首列），后续用例可用 ${db_user_id}
+      db_user_id: "SELECT id FROM t_user WHERE mobile = '${test_mobile}'"
+
+    db_teardown:                      # 清理：无论断言成败都执行，防止数据残留
+      - "DELETE FROM t_user WHERE mobile = '${test_mobile}'"
+```
+
+#### 执行顺序
+
+```
+文件级 setup → db_setup → 请求(可选) → 接口断言(可选) → db_assertions
+              → extract / extract_from_db → finally: db_teardown
+```
+
+#### 规则说明
+
+| 规则 | 说明 |
+|------|------|
+| **时序** | `db_setup` 在请求**之前**执行；若需引用接口返回变量做 DB 校验（如落库校验），正常写在请求后的 `db_assertions` 即可；若需在 `db_setup` 中引用接口变量，请拆成两条用例跨用例传参 |
+| **变量替换** | 所有 SQL 均支持 `${var}` 变量替换；`db_assertions` 的 `expected` 整串占位符保留原始类型 |
+| **软断言** | `db_assertions` 多条校验全部执行，失败项一次性汇总（与接口断言同风格） |
+| **未配置 db** | 环境未配置 `db` 段时，用例使用了 `db_*` 字段会立即 `pytest.fail` 并提示补充配置 |
+| **连接生命周期** | 用例级：每条用例独立 `DBClient` 实例，用完即关（`db_client` fixture 的 function scope） |
+| **db_teardown** | 在 `finally` 中执行，无论断言成败都跑；清理失败会单独 `pytest.fail` 提示数据可能残留，但不吞掉原始断言失败 |
+| **离线演示** | 使用 `driver: sqlite` 可在无数据库环境下验证 DB 校验逻辑 |
+
+#### db_assertions 三种校验类型
+
+| type | 实际值 | 比较方式 | 字段 |
+|------|--------|---------|------|
+| `row_count` | SQL 查询结果行数 | 按 `op`（默认 `==`）与 `expected` 比较 | `sql`, `op`, `expected` |
+| `value` | 首行 `column` 列的值（缺省第一列） | 按 `op` 与 `expected` 比较 | `sql`, `column`, `op`, `expected` |
+| `contains_row` | 查询结果列表（或 `column` 指定列的值列表） | `assert_contains(actual, expected)` | `sql`, `column`, `expected` |
 
 ---
 
@@ -1210,6 +1403,7 @@ A：修改 `config.yaml → log.level` 为 `WARNING`，或调小 `rotation`（�
 | Setup 执行 | [utils/setup_runner.py](file:///d:/pythontest/ziufileApi/utils/setup_runner.py) |
 | 脱敏工具 | [utils/masking.py](file:///d:/pythontest/ziufileApi/utils/masking.py) |
 | 邮件摘要 | [utils/result_summary.py](file:///d:/pythontest/ziufileApi/utils/result_summary.py) |
+| 数据库客户端 | [utils/db_client.py](file:///d:/pythontest/ziufileApi/utils/db_client.py) |
 | 统一运行脚本 | [run_test.py](file:///d:/pythontest/ziufileApi/run_test.py) |
 | Windows 批处理 | [run_test.bat](file:///d:/pythontest/ziufileApi/run_test.bat) |
 | 调试脚本 | [debug_test.py](file:///d:/pythontest/ziufileApi/debug_test.py) |
