@@ -11,6 +11,7 @@ __pycache__/
 # 运行产物
 logs/
 reports/
+docs/
 
 # 系统文件
 Thumbs.db
