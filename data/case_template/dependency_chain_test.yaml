@@ -1,0 +1,228 @@
+# ============================================================================
+# 接口依赖链（接口关联）完整示例 —— 仅供参考的模板文件
+# 本文件位于 data/case_template/ 下，不会被实际执行扫描（用例目录由 config.yaml
+# 的 caseData_path 指定，默认是 data/client_data 与 data/station_data），
+# 接入真实项目时复制到对应用例目录并按需修改。
+# ----------------------------------------------------------------------------
+# 依赖实现四要素：
+#   1. extract   ：用例执行后从响应体按 JSONPath 提取值，写入 session 级 global_vars
+#   2. ${var}    ：在请求参数、URL、断言期望值中引用变量
+#                  整串占位符（如 "${user_id}"）保留原始类型（数字不会变成字符串）
+#   3. depends_on：显式依赖声明，上游失败/跳过/未执行时本用例自动 skip（带原因）
+#   4. run_if    ：条件执行，变量满足条件才执行，不满足时 skip（不是失败）
+# ----------------------------------------------------------------------------
+# 本示例演示的依赖链：
+#   [文件级setup] 登录 → token
+#     └─ 用例1 创建收货地址       → address_id
+#           └─ 用例2 查询商品     → sku_id, price
+#                 └─ 用例3 创建订单（用 token + address_id + sku_id）→ order_id, order_no
+#                       ├─ 用例4 支付订单（用 token + order_no，价格>0 才执行）→ pay_no
+#                       └─ 用例5 查询订单详情（用 token + order_id）+ 数据库落库校验
+# ----------------------------------------------------------------------------
+# 执行顺序说明：
+#   - 收集期按 depends_on 依赖图做拓扑排序：生产者一定先于消费者执行，
+#     跨文件依赖不依赖文件名排序（无需 01_、02_ 前缀约定）
+#   - 无依赖关系的用例按书写顺序（跨文件按文件名序）执行，顺序稳定
+#   - 推荐书写顺序与依赖方向一致，便于阅读
+# ----------------------------------------------------------------------------
+# 注意事项：
+#   - 变量写入的是 session 级 global_vars，跨用例/跨文件共享，同名变量会被覆盖
+#   - depends_on 是强依赖：上游 failed / skipped（含上游 run_if 不满足）都会让本用例 skip
+#   - cache: true 可跨文件复用登录结果，但若业务会改变账号状态（如注销）切勿开启
+# ============================================================================
+
+description: "接口依赖链示例：登录 -> 建地址 -> 查商品 -> 下单 -> 支付 -> 查详情"
+tags: ["依赖链", "示例"]
+
+# ---------------------------------------------------------------------------
+# 文件级前置步骤：本文件所有用例执行前统一登录一次，token 自动注入 global_vars
+# 该文件所有用例可通过 ${token} 直接引用；setup 失败则本文件全部用例统一失败
+# ---------------------------------------------------------------------------
+setup:
+  cache: true                          # 相同登录内容 + 相同环境只执行一次，跨文件复用
+  steps:
+    - name: "用户登录（前置）"
+      description: "测试用户登录接口 /appUser/codeLogin"
+      request:
+        method: "POST"
+        url: "/appUser/codeLogin"
+        headers:
+          Content-Type: "application/json"
+        json:
+          mobile: "19999999999"        # 真实项目建议改为预置变量或环境变量，避免明文
+          code: "000000"
+          registrationId: "string"
+      assertions:
+        - type: "status_code"
+          expected: 200
+          message: "登录检查响应状态码"
+      extract:
+        token: "data.token"            # → 供本文件所有用例使用
+
+testcases:
+  # -------------------------------------------------------------------------
+  # 用例1：创建收货地址（依赖 setup 的 token，产出 address_id 供用例3使用）
+  # -------------------------------------------------------------------------
+  - name: "1. 创建收货地址"
+    description: "登录后创建收货地址，提取 address_id 供后续下单使用"
+    tags: ["post", "依赖链"]
+    request:
+      method: "POST"
+      url: "/address/create"
+      headers:
+        Content-Type: "application/json"
+        Authorization: "Bearer ${token}"      # 引用 setup 提取的 token
+      json:
+        receiver: "自动化测试"
+        mobile: "19999999999"
+        detail: "测试地址-自动化生成"
+    assertions:
+      - type: "status_code"
+        expected: 200
+        message: "创建地址状态码"
+      - type: "equal"
+        jsonpath: "code"
+        expected: 0
+        message: "创建地址业务码"
+    extract:
+      address_id: "data.addressId"             # → 用例3 引用
+
+  # -------------------------------------------------------------------------
+  # 用例2：查询商品（依赖 setup 的 token，产出 sku_id / price 供用例3使用）
+  # -------------------------------------------------------------------------
+  - name: "2. 查询商品列表"
+    description: "查询可售商品，取第一个商品的 skuId 与价格"
+    tags: ["get", "依赖链"]
+    request:
+      method: "GET"
+      url: "/goods/list"
+      headers:
+        Authorization: "Bearer ${token}"
+      params:
+        pageNum: 1
+        pageSize: 1
+    assertions:
+      - type: "status_code"
+        expected: 200
+        message: "查询商品状态码"
+      - type: "greater_or_equal"               # 确保有商品可取，避免后续依赖链断裂
+        jsonpath: "data.total"
+        expected: 1
+        message: "商品总数应大于等于1"
+    extract:
+      sku_id: "data.list[0].skuId"             # → 用例3 引用
+      sku_price: "data.list[0].price"          # → 用例3、用例5 引用（数字类型保留）
+
+  # -------------------------------------------------------------------------
+  # 用例3：创建订单（同时依赖 token + address_id + sku_id，产出 order_id/order_no）
+  # -------------------------------------------------------------------------
+  - name: "3. 创建订单"
+    description: "用地址、商品、登录态创建订单"
+    depends_on:                             # 显式依赖：两条上游都 passed 才执行
+      - "1. 创建收货地址"                    # 用例名引用（全局唯一时）
+      - "2. 查询商品列表"                    # 任一失败/跳过则本用例自动 skip
+    tags: ["post", "依赖链"]
+    request:
+      method: "POST"
+      url: "/order/create"
+      headers:
+        Content-Type: "application/json"
+        Authorization: "Bearer ${token}"
+      json:
+        addressId: "${address_id}"             # 来自用例1（整串占位符，保留数字类型）
+        items:
+          - skuId: "${sku_id}"                 # 来自用例2
+            quantity: 1
+    assertions:
+      - type: "status_code"
+        expected: 200
+        message: "创建订单状态码"
+      - type: "equal"
+        jsonpath: "code"
+        expected: 0
+        message: "创建订单业务码"
+    extract:
+      order_id: "data.orderId"                 # → 用例5 引用
+      order_no: "data.orderNo"                 # → 用例4 引用
+
+  # -------------------------------------------------------------------------
+  # 用例4：支付订单（依赖 token + order_no，产出 pay_no）
+  # -------------------------------------------------------------------------
+  - name: "4. 支付订单"
+    description: "对刚创建的订单发起支付（商品价格大于0才执行，否则 skip）"
+    depends_on: ["3. 创建订单"]              # 上游失败则本用例自动 skip，不会带着失效的 order_no 支付
+    run_if:                                 # 条件执行：不满足时 skip（不是失败）
+      var: sku_price                        # 取自 global_vars（extract / setup / 预置变量）
+      op: gt                                # 支持 eq(默认) ne gt ge lt le in not_in contains exists not_exists
+      value: 0
+    tags: ["post", "依赖链"]
+    request:
+      method: "POST"
+      url: "/order/pay"
+      headers:
+        Content-Type: "application/json"
+        Authorization: "Bearer ${token}"
+      json:
+        orderNo: "${order_no}"                 # 来自用例3
+        payAmount: "${sku_price}"              # 来自用例2
+    assertions:
+      - type: "status_code"
+        expected: 200
+        message: "支付状态码"
+      - type: "equal"
+        jsonpath: "code"
+        expected: 0
+        message: "支付业务码"
+    extract:
+      pay_no: "data.payNo"                     # → 可继续供后续用例引用
+
+  # -------------------------------------------------------------------------
+  # 用例5：校验订单详情（链尾校验：接口返回 + 数据库落库双重校验）
+  #   依赖 token + order_id + sku_price + pay_no
+  # -------------------------------------------------------------------------
+  - name: "5. 查询订单详情并校验"
+    description: "查询订单详情，接口与数据库双重校验支付结果"
+    depends_on: ["4. 支付订单"]              # 支付被 skip（如 run_if 不满足）时本用例同样 skip
+    tags: ["get", "依赖链", "API+DB"]
+    request:
+      method: "GET"
+      url: "/order/detail/${order_id}"         # 路径参数也支持 ${var}
+      headers:
+        Authorization: "Bearer ${token}"
+      params:
+        payNo: "${pay_no}"
+    assertions:
+      - type: "status_code"
+        expected: 200
+        message: "订单详情状态码"
+      # 断言期望值引用上游提取的变量：订单金额应与下单时的商品价格一致
+      - type: "equal"
+        jsonpath: "data.orderId"
+        expected: "${order_id}"
+        message: "订单ID与创建时一致"
+      - type: "equal"
+        jsonpath: "data.payStatus"
+        expected: "PAID"
+        message: "订单支付状态"
+    # 数据库落库校验（需在 config.yaml 对应环境配置 db 段；无需 DB 时整段删除即可）
+    db_assertions:
+      - type: "value"
+        sql: "SELECT pay_status FROM t_order WHERE id = ${order_id}"
+        expected: "PAID"
+        message: "库中订单状态应为已支付"
+      - type: "row_count"
+        sql: "SELECT id FROM t_pay_record WHERE order_id = ${order_id}"
+        op: ">="
+        expected: 1
+        message: "应存在支付流水记录"
+
+# ---------------------------------------------------------------------------
+# 关于链中某一步失败的影响（depends_on 语义）：
+#   依赖是显式声明的强依赖。若用例2 失败，用例3 会自动 skip 并在报告中给出原因
+#   （"依赖的用例 [...] 执行失败，跳过"），skip 会沿链向下游传播（3 skip → 4/5 skip）。
+#   不再出现 "${sku_id}" 字面量原样发出导致的误导性失败。
+#   依赖引用写错（不存在的用例 / 名称不唯一 / 依赖自身 / 循环依赖）在收集期
+#   即转为一条失败用例并给出具体原因，不会静默失效。
+#   跨文件依赖用 "用例文件相对路径::用例名" 指定，例如：
+#     depends_on: ["data/client_data/login_test.yaml::用户登录"]
+# ---------------------------------------------------------------------------

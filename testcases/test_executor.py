@@ -5,6 +5,7 @@ import allure
 import pytest
 from loguru import logger
 
+from utils import dependency
 from utils import setup_runner
 from utils.config import PROJECT_ROOT, get_config
 from utils.masking import mask_data, register_extracted
@@ -32,15 +33,48 @@ def _run_db_statements(db_client, statements, yaml_parser, global_vars, step_lab
             allure.attach(str(affected), "影响行数", allure.attachment_type.TEXT)
 
 
-def test_api_executor(case_file: str, case: dict, yaml_parser, http_client, assertion, global_vars, db_client):
+def test_api_executor(case_file: str, case: dict, case_id: str,
+                      yaml_parser, http_client, assertion, global_vars, db_client):
     """API测试执行器：每个YAML测试用例作为独立的pytest用例执行
 
-    执行顺序：文件级setup -> db_setup -> 请求(可选) -> 接口断言(可选) -> db_assertions
+    执行顺序：依赖判定(depends_on) -> 条件判定(run_if) -> 文件级setup -> db_setup
+              -> 请求(可选) -> 接口断言(可选) -> db_assertions
               -> extract / extract_from_db -> finally: db_teardown
     用例收集与参数化见 conftest.py 的 pytest_generate_tests。
+
+    用例最终结果（passed/failed/skipped）记入 session 级注册表，
+    供下游 depends_on 用例判定：上游 failed/skipped/未执行 时下游自动 skip，
+    避免带着未替换的字面量 "${var}" 发请求产生误导性失败。
     """
+    try:
+        _execute_case(case_file, case, yaml_parser, http_client, assertion, global_vars, db_client)
+        dependency.record_result(case_id, "passed")
+    except pytest.skip.Exception:
+        dependency.record_result(case_id, "skipped")
+        raise
+    except (pytest.fail.Exception, Exception):
+        dependency.record_result(case_id, "failed")
+        raise
+
+
+def _execute_case(case_file: str, case: dict,
+                  yaml_parser, http_client, assertion, global_vars, db_client):
+    """单条用例的执行主体（结果登记见 test_api_executor）"""
     if "_collect_error" in case:
         pytest.fail(f"用例收集失败: {case['_collect_error']}")
+
+    # 依赖判定：上游 failed/skipped/未执行 时本用例 skip（原因见 utils/dependency.py）
+    dep_reason = dependency.check_dependencies(case)
+    if dep_reason:
+        logger.info(f"依赖不满足，跳过用例: {dep_reason}")
+        pytest.skip(dep_reason)
+
+    # 条件执行判定：run_if 不满足时本用例 skip（不满足不是失败）
+    if case.get("run_if"):
+        cond_reason = dependency.evaluate_run_if(case["run_if"], global_vars, yaml_parser)
+        if cond_reason:
+            logger.info(f"条件不满足，跳过用例: {cond_reason}")
+            pytest.skip(cond_reason)
 
     case_name = case.get("name", "未命名测试用例")
     logger.info(f"开始执行测试用例: {case_file} :: {case_name}")

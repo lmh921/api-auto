@@ -21,13 +21,12 @@
    - 4.8 [masking · 敏感信息脱敏](#48-maskingpy-敏感信息脱敏)
    - 4.9 [result_summary · 测试结果摘要](#49-result_summarypy-测试结果摘要)
    - 4.10 [db_client · 数据库客户端](#410-db_clientpy-数据库客户端)
+   - 4.11 [dependency · 用例依赖与条件执行](#411-dependencypy-用例依赖与条件执行)
 5. [入口与执行层](#5-入口与执行层)
    - 5.1 [conftest.py · Pytest 配置与 Fixtures](#51-conftestpy-pytest-配置与-fixtures)
    - 5.2 [test_executor.py · 用例执行主体](#52-test_executorpy-用例执行主体)
    - 5.3 [run_test.py · 统一运行脚本](#53-run_testpy-统一运行脚本)
    - 5.4 [run_test.bat · Windows 菜单式批处理](#54-run_testbat-windows-菜单式批处理)
-   - 5.5 [debug_test.py · 手动调试脚本](#55-debug_testpy-手动调试脚本)
-   - 5.6 [test_framework.py · 框架功能自检](#56-test_frameworkpy-框架功能自检)
 6. [依赖关系](#6-依赖关系)
    - 6.1 [第三方依赖](#61-第三方依赖)
    - 6.2 [内部模块依赖图](#62-内部模块依赖图)
@@ -44,6 +43,7 @@
    - 8.6 [断言类型一览](#86-断言类型一览)
    - 8.7 [JSONPath 语法](#87-jsonpath-语法)
    - 8.8 [数据库连接与校验](#88-数据库连接与校验)
+   - 8.9 [用例依赖与条件执行](#89-用例依赖与条件执行)
 9. [项目运行方式](#9-项目运行方式)
    - 9.1 [环境准备](#91-环境准备)
    - 9.2 [本地运行](#92-本地运行)
@@ -78,6 +78,8 @@
 | 用例结构校验 | YAML 结构不合规生成显式失败用例而非静默跳过 |
 | Marker 支持 | 用例 tags 自动映射 pytest marker，`-m smoke` 圈选用例 |
 | **数据库断言** | 支持 `db_setup` / `db_assertions` / `extract_from_db` / `db_teardown`，MySQL + SQLite 双驱动，用例级连接生命周期 |
+| **用例依赖** | `depends_on` 显式依赖：上游失败/跳过/未执行时下游自动 skip；依赖图拓扑排序，跨文件依赖不依赖文件名排序 |
+| **条件执行** | `run_if` 按变量条件决定执行与否，不满足时 skip（不是失败） |
 
 ### 1.2 技术栈
 
@@ -208,8 +210,6 @@ ziufileApi/
 ├── requirements.txt                # 第三方依赖清单
 ├── run_test.py                     # argparse 统一运行脚本（推荐入口）
 ├── run_test.bat                    # Windows 菜单式批处理
-├── debug_test.py                   # 开发者手动调试脚本
-├── test_framework.py               # 框架 4 大模块自检脚本
 ├── Jenkinsfile                     # Jenkins 声明式流水线（装依赖→测→报→邮）
 ├── .gitignore                      # 忽略 pycache / venv / logs / reports
 ├── README.md                       # 用户使用手册
@@ -474,6 +474,7 @@ def run_db_assertions(self, db_client, db_assertions: List[Dict]) -> None:
 - 用 **JSON Schema** 校验 setup 与 单条 case 的结构合规性
 - 结构错误 / YAML 解析错误 → 生成显式失败用例（带 `_collect_error` 字段），不会静默丢失
 - 注册文件级 setup 到全局字典 `FILE_SETUPS`
+- **解析 `depends_on` 引用**（存在性/唯一性/自身依赖校验）并按依赖图**拓扑排序**：生产者先于消费者，跨文件依赖不依赖文件名排序；无依赖用例保持原顺序
 - 生成形如 `路径::用例名` 的唯一用例 ID（重名追加 `#2`、`#3`）
 
 #### 常量与 Schema
@@ -481,16 +482,18 @@ def run_db_assertions(self, db_client, db_assertions: List[Dict]) -> None:
 | 名称 | 类型 | 说明 |
 |------|------|------|
 | `FILE_SETUPS` | `Dict[str, dict]` | 全局注册表：`rel_path → {cache, steps}` |
-| `CASE_SCHEMA` | JSON Schema | 要求 `name` + 以下四选一：`request` / `db_assertions` / `db_setup` / `extract_from_db`（纯数据库校验用例可省略 request）；允许 `tags/env/assertions/extract/db_setup/db_teardown/db_assertions/extract_from_db` |
-| `SETUP_SCHEMA` | JSON Schema | 要求 `steps[]`；可选 `cache: bool` |
+| `CASE_SCHEMA` | JSON Schema | 要求 `name` + 以下四选一：`request` / `db_assertions` / `db_setup` / `extract_from_db`（纯数据库校验用例可省略 request）；允许 `tags/env/assertions/extract/db_setup/db_teardown/db_assertions/extract_from_db/depends_on/run_if` |
+| `SETUP_SCHEMA` | JSON Schema | 要求 `steps[]`；可选 `cache: bool`；setup 步骤中出现 `depends_on`/`run_if` 会校验失败（无跳过语义） |
 
 #### 关键函数
 
 | 函数 | 签名 | 说明 |
 |------|------|------|
-| `get_test_case_files(config)` | `(Config) -> List[Path]` | 按文件名排序；排除模板文件 |
+| `get_test_case_files(config)` | `(Config) -> List[Path]` | 按文件名排序（初始顺序）；排除模板文件 |
 | `_validate_schema(instance, schema)` | `(Any, dict) -> List[str]` | 返回错误列表；空列表=通过 |
-| `collect_all_cases(config)` | `(Config) -> List[Tuple[str, dict]]` | 核心：返回 `(相对路径, 用例dict)` 列表 |
+| `collect_all_cases(config)` | `(Config) -> List[Tuple[str, dict]]` | 核心：返回 `(相对路径, 用例dict)` 列表；末尾调用 `resolve_and_sort` |
+| `resolve_and_sort(entries)` | `(List[Tuple]) -> List[Tuple]` | 解析 depends_on 引用（改写为 `文件::用例名` 规范形式）+ 拓扑排序；引用不存在/名称不唯一/依赖自身/循环依赖 → 转为 `_collect_error` 失败用例 |
+| `_entry_key(rel_path, case)` | `(str, dict) -> str` | 用例规范引用形式 `rel_path::name`（与结果注册表 key 一致） |
 | `build_case_ids(entries)` | `(List[Tuple]) -> List[str]` | 生成 `rel_path::name` 唯一 ID |
 
 #### 错误用例机制
@@ -680,6 +683,39 @@ files:
 
 ---
 
+### 4.11 dependency.py · 用例依赖与条件执行
+
+**文件**：[utils/dependency.py](file:///d:/pythontest/ziufileApi/utils/dependency.py)
+
+#### 职责
+
+- 维护 **session 级用例结果注册表** `CASE_RESULTS`：`case_id基名 → "passed" / "failed" / "skipped"`，由 test_executor 在用例结束时写入
+- **depends_on 判定**：上游 failed / skipped / 未执行（被 `-m`/`-k` 过滤）→ 下游 `pytest.skip` 并给出具体原因，避免带着字面量 `${var}` 产生误导性失败
+- **run_if 求值**：对 `global_vars` 中的变量按比较符判定，不满足 → skip（不是失败）
+
+#### 常量与注册表
+
+| 名称 | 类型 | 说明 |
+|------|------|------|
+| `CASE_RESULTS` | `Dict[str, str]` | 结果注册表；key 为 `rel_path::name` 基名（与 `depends_on` 规范引用一致）；conftest 收集期 `clear()` |
+| `RUN_IF_OPS` | `tuple` | `eq ne gt ge lt le in not_in contains exists not_exists`（同时作为 CASE_SCHEMA 的 op 枚举） |
+
+#### 关键函数
+
+| 函数 | 签名 | 说明 |
+|------|------|------|
+| `record_result(case_id, status)` | `(str, str) -> None` | 用例结束时登记结果（test_executor 的 try/except 全路径调用） |
+| `check_dependencies(case)` | `(dict) -> Optional[str]` | 返回 None=依赖满足；返回 str=应 skip 的原因（引用已在收集期规范化） |
+| `evaluate_run_if(run_if, global_vars, yaml_parser)` | `(dict, dict, YamlParser) -> Optional[str]` | 返回 None=条件满足；`value` 支持 `${var}`；实际值进报告前脱敏 |
+| `_to_number(value)` / `_compare(actual, op, expected)` | 内部 | 数值转换（bool 视为非数值，避免 `True == 1` 意外匹配）与比较实现 |
+
+> 设计要点：
+> - 注册表只支持单进程（pytest-xdist 与 session 级 `global_vars` 本就不兼容，既有约束）。
+> - skip 语义为强依赖且**沿链传播**：A 失败 → B skip → 依赖 B 的 C 也 skip。
+> - 收集期已拓扑排序，整批执行时读到的一定是上游最终结果；"未执行"分支仅在上游被圈选过滤时出现。
+
+---
+
 ## 5. 入口与执行层
 
 ### 5.1 conftest.py · Pytest 配置与 Fixtures
@@ -692,7 +728,7 @@ files:
 |------|------|
 | **日志初始化**（模块顶层） | `logger.remove() → logger.configure(patcher=redact_text)` → 双 sink：文件（100MB 滚动 / 7天保留）+ 控制台彩色输出 |
 | `pytest_addoption(parser)` | 注册自定义组 `ziufile-api`：<br>`--env`（环境名）、`--confirm-prod`（正式环境确认开关） |
-| `pytest_generate_tests(metafunc)` | 核心：只对 `case` fixture 生效 → 调用 `collect_all_cases` + `build_case_ids` → 用 `pytest.param(rel_path, MaskedDict(case), id=case_id, marks=marker_list)` 做参数化。<br>**tags → markers 映射**：用例 tags 与 pytest.ini 中注册的 marker 同名者自动挂对应 pytest mark，支持 `-m smoke` 圈选。<br>**MaskedDict**：参数对象 repr 脱敏，防止 pytest 失败回显/Allure 参数泄漏。 |
+| `pytest_generate_tests(metafunc)` | 核心：只对 `case` fixture 生效 → 调用 `collect_all_cases`（含 depends_on 解析+拓扑排序）+ `build_case_ids` → 清空 `CASE_RESULTS`（收集先于执行，安全）→ 用 `pytest.param(rel_path, MaskedDict(case), case_id, id=..., marks=...)` 三值参数化（case_id 透传给执行器登记结果）。<br>**tags → markers 映射**：用例 tags 与 pytest.ini 中注册的 marker 同名者自动挂对应 pytest mark，支持 `-m smoke` 圈选。<br>**MaskedDict**：参数对象 repr 脱敏，防止 pytest 失败回显/Allure 参数泄漏。 |
 
 #### Fixtures
 
@@ -711,14 +747,18 @@ files:
 
 **文件**：[testcases/test_executor.py](file:///d:/pythontest/ziufileApi/testcases/test_executor.py)
 
-#### `test_api_executor(case_file, case, yaml_parser, http_client, assertion, global_vars, db_client)`
+#### `test_api_executor(case_file, case, case_id, yaml_parser, http_client, assertion, global_vars, db_client)`
 
-**执行顺序**：文件级 setup → `db_setup` → 请求(可选) → 接口断言(可选) → `db_assertions` → `extract` / `extract_from_db` → `finally: db_teardown`
+**执行顺序**：依赖判定(depends_on) → 条件判定(run_if) → 文件级 setup → `db_setup` → 请求(可选) → 接口断言(可选) → `db_assertions` → `extract` / `extract_from_db` → `finally: db_teardown`
+
+**结果登记**：执行主体提取到 `_execute_case`；外层 try/except 按退出路径登记 `case_id` 结果——正常返回 → passed；`pytest.skip.Exception` → skipped；`pytest.fail.Exception` 及其他异常 → failed（供下游 depends_on 判定）。
 
 **执行流程**（每条参数化用例走一次）：
 
 ```
 0. _collect_error 检测 → 有则立即 pytest.fail
+0.5 依赖判定：check_dependencies → 上游 failed/skipped/未执行 → pytest.skip（带原因）
+0.6 条件判定：run_if 存在且不满足 → pytest.skip（带原因）
 1. Allure 动态打标
      title       = case.name
      description = case.description
@@ -755,6 +795,7 @@ files:
 > - `db_setup` 用独立 try（不在大 try 内）：前置造数失败应直接终止用例，不进入请求阶段。
 > - `db_teardown` 在 finally 中执行，且清理失败不吞掉原始断言失败（用 `teardown_error` 单独记录，原始异常继续传播）。
 > - 纯数据库校验用例可省略 `request` 字段，此时 `response=None`，`extract` 自动跳过。
+> - 结果登记覆盖全部退出路径（passed/failed/skipped），setup 失败、依赖 skip、run_if skip 均会被下游 depends_on 正确感知。
 
 ---
 
@@ -789,30 +830,6 @@ files:
 | 4 | `allure open` |
 | 5 | 完整流程：1→2→3→4（任一步失败中断） |
 | 6 | 退出 |
-
----
-
-### 5.5 debug_test.py · 手动调试脚本
-
-**文件**：[debug_test.py](file:///d:/pythontest/ziufileApi/debug_test.py)
-
-开发者可直接编辑脚本里的 `file_path`，按以下流程跑单个 YAML 文件逐条用例：
-`parse_test_cases → replace_variables → request → run_assertions → extract → update global_vars`。
-用于在无 pytest 环境下快速验证单个 YAML 的逻辑正确性。
-
----
-
-### 5.6 test_framework.py · 框架功能自检
-
-**文件**：[test_framework.py](file:///d:/pythontest/ziufileApi/test_framework.py)
-
-4 个用例的自检脚本：
-1. `test_config_loader` → Config 加载
-2. `test_yaml_parser` → 解析 mock_test.yaml
-3. `test_http_client` → 初始化 HttpClient
-4. `test_assertion` → 内存断言模拟
-
-结束输出 `通过: X/4`，退出码按结果。用于搭建新环境时快速验证框架基本能力。
 
 ---
 
@@ -871,6 +888,9 @@ setup_runner  assertion.py  test_executor
 result_summary.py   ← 独立模块，直接读 allure-results JSON
 
 db_client.py        ← 仅依赖 config.PROJECT_ROOT；被 conftest / test_executor 通过 fixture 注入
+
+dependency.py       ← 仅依赖 masking（skip消息脱敏）；被 case_collector（RUN_IF_OPS 枚举）/
+                       conftest（清空注册表）/ test_executor（登记结果+判定）引用
 ```
 
 **依赖表（谁 import 谁）**：
@@ -882,16 +902,15 @@ db_client.py        ← 仅依赖 config.PROJECT_ROOT；被 conftest / test_exec
 | yaml_parser.py | （无） |
 | http_client.py | masking.mask_data；config.get_config（懒加载） |
 | assertion.py | （无；第三方 jsonpath-ng） |
-| case_collector.py | config.PROJECT_ROOT/Config；yaml_parser.YamlParser；（第三方 jsonschema） |
+| dependency.py | masking.mask_data |
+| case_collector.py | config.PROJECT_ROOT/Config；yaml_parser.YamlParser；dependency.RUN_IF_OPS；（第三方 jsonschema） |
 | step_runner.py | config.PROJECT_ROOT；yaml_parser.YamlParser |
 | setup_runner.py | case_collector.FILE_SETUPS；config.PROJECT_ROOT；masking（mask_data/register_extracted）；step_runner（全部） |
 | result_summary.py | （无；标准库 argparse/json/html/pathlib） |
 | db_client.py | config.PROJECT_ROOT；pymysql（懒加载，仅 mysql 驱动） |
-| conftest.py | utils.http_client / yaml_parser / assertion / config / case_collector / masking / db_client（懒加载） |
-| testcases/test_executor.py | utils.setup_runner / config / masking / step_runner |
+| conftest.py | utils.http_client / yaml_parser / assertion / config / case_collector / dependency / masking / db_client（懒加载） |
+| testcases/test_executor.py | utils.setup_runner / config / masking / step_runner / dependency |
 | run_test.py | （调用 pytest.main；无直接 import utils） |
-| debug_test.py | utils.yaml_parser / http_client / assertion / config |
-| test_framework.py | utils.yaml_parser / http_client / assertion / config |
 
 ---
 
@@ -1200,6 +1219,52 @@ testcases:
 | `value` | 首行 `column` 列的值（缺省第一列） | 按 `op` 与 `expected` 比较 | `sql`, `column`, `op`, `expected` |
 | `contains_row` | 查询结果列表（或 `column` 指定列的值列表） | `assert_contains(actual, expected)` | `sql`, `column`, `expected` |
 
+### 8.9 用例依赖与条件执行
+
+跨用例传参（`extract` + `${var}`）解决"数据从哪来"，`depends_on` / `run_if` 解决"什么时候该执行"。
+
+#### depends_on：显式依赖声明
+
+```yaml
+testcases:
+  - name: "3. 创建订单"
+    depends_on:                           # 可依赖多条，全部 passed 才执行
+      - "1. 创建收货地址"                  # 用例名引用（全局唯一时）
+      - "data/client_data/goods.yaml::2. 查询商品"   # 重名/跨文件用 文件相对路径::用例名
+    request: { method: "POST", url: "/order/create" }
+```
+
+| 规则 | 说明 |
+|------|------|
+| 强依赖 | 上游 failed / skipped（含上游 run_if 不满足、再上游失败）/ 未执行 → 本用例 `pytest.skip`，原因写入报告（`-rs` 查看） |
+| skip 沿链传播 | A 失败 → B skip → 依赖 B 的 C 也 skip |
+| 执行顺序 | 收集期按依赖图**拓扑排序**，生产者一定先于消费者，跨文件依赖不依赖文件名排序；无依赖用例保持文件名+书写顺序 |
+| 收集期校验 | 引用不存在 / 名称不唯一 / 依赖自身 / 循环依赖 → 转为一条失败用例并给出具体原因（循环依赖列出环上所有用例） |
+| 圈选过滤 | `-m` / `-k` 把上游过滤掉时，下游以"依赖的用例 [...] 未执行"skip 而非报错 |
+| 适用范围 | 仅 `testcases` 用例；`setup` 步骤中写会校验失败（无跳过语义） |
+
+#### run_if：条件执行
+
+```yaml
+  - name: "4. 支付订单"
+    run_if:
+      var: sku_price        # 取自 global_vars（extract / extract_from_db / setup / 预置变量）
+      op: gt                # 默认 eq
+      value: 0              # 支持 ${var} 引用其他变量
+```
+
+| op | 说明 |
+|----|------|
+| `eq` / `ne` | 相等 / 不相等（严格比较，注意 YAML 类型：`"1"` ≠ `1`） |
+| `gt` / `ge` / `lt` / `le` | 数值比较（两侧需为数值或数值字符串；bool 不参与数值比较） |
+| `in` / `not_in` | `value` 需为列表 |
+| `contains` | 实际值（str/list/dict）包含期望值 |
+| `exists` / `not_exists` | 变量是否存在（无需 `value`） |
+
+不满足时 skip（不是失败），skip 原因中的实际值自动脱敏。判定发生在依赖判定之后、文件 setup 之前。
+
+> 完整示例：`data/case_template/dependency_chain_test.yaml`；实现细节见 [4.11 dependency 模块](#411-dependencypy-用例依赖与条件执行)。
+
 ---
 
 ## 9. 项目运行方式
@@ -1406,8 +1471,6 @@ A：修改 `config.yaml → log.level` 为 `WARNING`，或调小 `rotation`（�
 | 数据库客户端 | [utils/db_client.py](file:///d:/pythontest/ziufileApi/utils/db_client.py) |
 | 统一运行脚本 | [run_test.py](file:///d:/pythontest/ziufileApi/run_test.py) |
 | Windows 批处理 | [run_test.bat](file:///d:/pythontest/ziufileApi/run_test.bat) |
-| 调试脚本 | [debug_test.py](file:///d:/pythontest/ziufileApi/debug_test.py) |
-| 框架自检 | [test_framework.py](file:///d:/pythontest/ziufileApi/test_framework.py) |
 | Jenkins 流水线 | [Jenkinsfile](file:///d:/pythontest/ziufileApi/Jenkinsfile) |
 | 依赖清单 | [requirements.txt](file:///d:/pythontest/ziufileApi/requirements.txt) |
 | 用户手册 | [README.md](file:///d:/pythontest/ziufileApi/README.md) |

@@ -2,15 +2,18 @@
 
 收集在 pytest_generate_tests 阶段完成，每个测试用例对应一个独立的pytest用例。
 结构不合法的用例不会被静默丢弃，而是生成一条失败用例并给出具体原因。
+depends_on 引用在收集期解析（存在性/唯一性/循环检测）并按依赖图拓扑排序，
+执行顺序由依赖关系决定，跨文件依赖不再依赖文件名排序。
 """
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import jsonschema
 from loguru import logger
 
 from utils.config import PROJECT_ROOT, Config
+from utils.dependency import RUN_IF_OPS
 from utils.yaml_parser import YamlParser
 
 # 用例文件级 setup 注册表：文件相对路径 -> {"cache": bool, "steps": [...]}
@@ -65,6 +68,21 @@ CASE_SCHEMA = {
             },
         },
         "extract": {"type": "object", "additionalProperties": {"type": "string"}},
+        # ---- 依赖与条件执行 ----
+        # 显式依赖：上游用例 failed/skipped/未执行 时本用例自动 skip；
+        # 引用为用例名（全局唯一时）或 "用例文件相对路径::用例名"（跨文件/重名时），
+        # 收集期解析为规范形式并按依赖图拓扑排序，跨文件依赖不依赖文件名排序
+        "depends_on": {"type": "array", "items": {"type": "string"}},
+        # 条件执行：global_vars 中的变量满足条件才执行，否则 skip（不满足不是失败）
+        "run_if": {
+            "type": "object",
+            "required": ["var"],
+            "properties": {
+                "var": {"type": "string"},
+                "op": {"type": "string", "enum": list(RUN_IF_OPS)},
+                "value": {},
+            },
+        },
         # ---- 数据库扩展 ----
         "db_setup": {"type": "array", "items": {"type": ["string", "object"]}},
         "db_teardown": {"type": "array", "items": {"type": ["string", "object"]}},
@@ -145,6 +163,10 @@ def collect_all_cases(config: Config) -> List[Tuple[str, Dict[str, Any]]]:
         # 文件级前置步骤 setup
         if "setup" in raw:
             errors = _validate_schema(raw["setup"], SETUP_SCHEMA)
+            # setup 步骤不支持 depends_on/run_if（无跳过语义），显式报错避免静默失效
+            for step in (raw["setup"].get("steps") or []):
+                if isinstance(step, dict) and ("depends_on" in step or "run_if" in step):
+                    errors.append("setup步骤不支持 depends_on/run_if（仅testcases用例可用）")
             if errors:
                 entries.append((rel_path, {"name": "setup定义不合法", "_collect_error": "；".join(errors)}))
                 continue
@@ -176,7 +198,98 @@ def collect_all_cases(config: Config) -> List[Tuple[str, Dict[str, Any]]]:
         else:
             logger.warning(f"用例文件中没有可执行的用例，已跳过: {rel_path}")
 
-    return entries
+    return resolve_and_sort(entries)
+
+
+def _entry_key(rel_path: str, case: Dict[str, Any]) -> str:
+    """用例的规范引用形式：文件相对路径::用例名（与结果注册表的key一致）"""
+    return f"{rel_path}::{case.get('name', '未命名测试用例')}"
+
+
+def resolve_and_sort(entries: List[Tuple[str, Dict[str, Any]]]) -> List[Tuple[str, Dict[str, Any]]]:
+    """解析 depends_on 引用并按依赖图拓扑排序
+
+    - 引用改写为规范形式 "文件相对路径::用例名"（运行期直接查结果注册表）
+    - 引用不存在 / 名称不唯一 / 依赖自身 / 循环依赖：转为收集失败用例
+      （沿用 _collect_error 机制，执行时直接 fail 并给出具体原因）
+    - 拓扑排序保证生产者先于消费者，跨文件依赖不再依赖文件名排序；
+      无依赖关系的用例保持原有（文件名+书写）顺序，执行顺序仍稳定
+    """
+    n = len(entries)
+    keys = [_entry_key(rel_path, case) for rel_path, case in entries]
+    names = [case.get("name") for _, case in entries]
+
+    # 第一遍：解析所有 depends_on 引用。引用写错的用例本身转为失败用例，
+    # 但保留其原条目参与解析（其他用例指向它仍有效，运行期会因上游失败而 skip）
+    resolved: List[Optional[List[str]]] = [None] * n
+    errors: Dict[int, str] = {}
+    for i, (_, case) in enumerate(entries):
+        refs = case.get("depends_on")
+        if not refs:
+            continue
+        canonical, err = [], []
+        for ref in refs:
+            if "::" in ref:
+                matches = [j for j in range(n) if keys[j] == ref]
+                if not matches:
+                    err.append(f"依赖的用例不存在: {ref}")
+                elif len(matches) > 1:
+                    err.append(f"依赖的用例名在同一文件中重复，无法唯一指定: {ref}")
+                else:
+                    canonical.append(ref)
+            else:
+                matches = [j for j in range(n) if names[j] == ref]
+                if not matches:
+                    err.append(f"依赖的用例不存在: {ref}（跨文件依赖请用 文件路径::用例名 指定）")
+                elif len(matches) > 1:
+                    err.append(f"依赖的用例名不唯一: {ref}（请改用 文件路径::用例名 指定）")
+                else:
+                    canonical.append(keys[matches[0]])
+        if keys[i] in canonical:
+            err.append(f"用例不能依赖自身: {keys[i]}")
+            canonical = [c for c in canonical if c != keys[i]]
+        if err:
+            errors[i] = "；".join(err)
+        else:
+            resolved[i] = canonical
+
+    # 规范引用 -> 唯一索引（解析阶段已保证引用唯一，此处直接建表）
+    key_index: Dict[str, int] = {}
+    for j, key in enumerate(keys):
+        key_index.setdefault(key, j)
+
+    # 第二遍：拓扑排序（稳定：每轮取最靠前的依赖已全部就绪的用例，
+    # 保持无依赖用例的原有顺序；O(n²) 对测试规模足够）
+    dep_indices = [{key_index[c] for c in refs} if refs else set()
+                   for refs in resolved]
+    placed = [False] * n
+    order: List[int] = []
+    for _ in range(n):
+        for i in range(n):
+            if not placed[i] and all(placed[d] for d in dep_indices[i]):
+                placed[i] = True
+                order.append(i)
+                break
+        else:
+            break  # 剩余用例互相依赖，存在循环
+    if len(order) < n:
+        cycle_members = [keys[i] for i in range(n) if not placed[i]]
+        for i in range(n):
+            if not placed[i]:
+                errors[i] = f"存在循环依赖，涉及用例: {' <-> '.join(cycle_members)}"
+        order.extend(i for i in range(n) if not placed[i])
+
+    # 第三遍：应用解析结果（depends_on 改写为规范引用）与错误（转为收集失败用例）
+    result: List[Tuple[str, Dict[str, Any]]] = []
+    for i in order:
+        rel_path, case = entries[i]
+        if i in errors:
+            entries[i] = (rel_path, {"name": case.get("name", "未命名测试用例"),
+                                     "_collect_error": f"depends_on 配置错误: {errors[i]}"})
+        elif resolved[i] is not None:
+            case["depends_on"] = resolved[i]
+        result.append(entries[i])
+    return result
 
 
 def build_case_ids(entries: List[Tuple[str, Dict[str, Any]]]) -> List[str]:

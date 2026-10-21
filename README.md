@@ -431,6 +431,46 @@ testcases:
 - 连接为用例级生命周期（每条用例独立连接，用完即关）；
 - 离线演示：`data/case_template/db_demo_test.yaml`（sqlite 驱动），`python run_test.py -e client-dev` 可直接运行。
 
+### 6.10 用例依赖与条件执行（depends_on / run_if）
+
+跨用例传参（`extract` + `${var}`）只解决了"数据从哪来"，`depends_on` / `run_if` 解决"什么时候该执行"：
+
+- **显式依赖** `depends_on`：声明的上游用例 failed / skipped / 未执行时，本用例自动 **skip**（带具体原因），不再带着未替换的字面量 `${var}` 发请求产生误导性失败；
+- **可靠执行顺序**：收集期按依赖图**拓扑排序**，生产者一定先于消费者执行，跨文件依赖**不再依赖文件名排序**（无需 `01_`、`02_` 前缀约定）；无依赖关系的用例仍按文件名 + 书写顺序执行，顺序稳定；
+- **条件执行** `run_if`：`global_vars` 中的变量满足条件才执行，不满足时 skip（**不满足不是失败**）。
+
+```yaml
+testcases:
+  - name: "1. 创建收货地址"
+    request: { method: "POST", url: "/address/create" }
+    extract:
+      address_id: "data.addressId"        # 产出变量
+
+  - name: "3. 创建订单"
+    depends_on:                           # 显式依赖：可依赖多条，全部 passed 才执行
+      - "1. 创建收货地址"                  # 用例名引用（全局唯一时）
+      - "data/client_data/order_test.yaml::2. 查询商品"   # 重名/跨文件时用 文件相对路径::用例名
+    request: { method: "POST", url: "/order/create" }
+
+  - name: "4. 支付订单"
+    depends_on: ["3. 创建订单"]
+    run_if:                               # 条件执行：商品价格大于0才支付
+      var: sku_price                      # 取自 global_vars（extract/extract_from_db/setup/预置变量）
+      op: gt                              # eq(默认) ne gt ge lt le in not_in contains exists not_exists
+      value: 0                            # 支持 ${var} 引用其他变量
+    request: { method: "POST", url: "/order/pay" }
+```
+
+**规则说明**：
+
+- 执行顺序（新增判定在前）：**依赖判定(depends_on) → 条件判定(run_if)** → 文件setup → `db_setup` → 请求 → 断言 → `db_assertions` → `extract` / `extract_from_db` → `finally: db_teardown`；
+- 依赖语义为**强依赖**：上游 failed、skipped（含上游自身的 run_if 不满足、再上游失败）都会导致本用例 skip；skip 原因会写进 pytest/Allure 报告（`-rs` 查看）；
+- 收集期校验并给出明确失败原因（转为一条失败用例而非静默丢弃）：**依赖的用例不存在**、**用例名不唯一**（改用 `文件路径::用例名`）、**依赖自身**、**循环依赖**（列出环上所有用例）；
+- 用 `-m` / `-k` 圈选时，若上游被过滤掉未执行，下游会以"依赖的用例 [...] 未执行"skip，而不是报错；
+- `depends_on` / `run_if` 仅对 `testcases` 用例生效，`setup` 步骤中写会直接校验失败；
+- 与 pytest-xdist 并行不兼容（session 级 `global_vars` 的既有约束，非本功能引入）；
+- 完整示例参考 `data/case_template/dependency_chain_test.yaml`。
+
 ## 7. 运行测试
 
 ### 7.1 使用Python脚本

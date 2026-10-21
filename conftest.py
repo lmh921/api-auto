@@ -7,6 +7,7 @@ from utils.yaml_parser import YamlParser
 from utils.assertion import Assertion
 from utils.config import get_config
 from utils.case_collector import build_case_ids, collect_all_cases
+from utils.dependency import CASE_RESULTS
 from utils.masking import MaskedDict, redact_text, register_extracted
 
 # 以本文件位置定位项目根目录，避免依赖启动时的当前工作目录
@@ -63,15 +64,18 @@ def pytest_generate_tests(metafunc):
     )
     entries = collect_all_cases(config)
     ids = build_case_ids(entries)
+    # 收集先于执行，此处清空依赖结果注册表是安全的（同进程重复调用pytest时防串场）
+    CASE_RESULTS.clear()
     known_markers = {m.split(":", 1)[0].strip() for m in metafunc.config.getini("markers")}
 
     params = []
     for (rel_path, case), case_id in zip(entries, ids):
         marks = [getattr(pytest.mark, tag) for tag in case.get("tags", []) if tag in known_markers]
         # case用MaskedDict包装：pytest失败回显与Allure参数记录输出repr时敏感字段自动脱敏
-        params.append(pytest.param(rel_path, MaskedDict(case), id=case_id, marks=marks))
+        # case_id透传给执行器，用例结束后据此登记结果，供下游depends_on判定
+        params.append(pytest.param(rel_path, MaskedDict(case), case_id, id=case_id, marks=marks))
 
-    metafunc.parametrize("case_file,case", params)
+    metafunc.parametrize("case_file,case,case_id", params)
 
 
 @pytest.fixture(scope="session")
