@@ -54,6 +54,20 @@ retry_delay: 2.0
 #   test_mobile: "$ENV{TEST_MOBILE}"
 variables: {}
 
+# 变量作用域（详见 utils/variable_scope.py 与 README 变量章节）
+#   mode:
+#     strict  提取变量按用例作用域隔离：extract 产物仅本用例可见，
+#             沿 depends_on 链向下游传播（传递闭包）；文件 setup 提取仅本文件可见；
+#             未声明依赖却引用上游变量时 ${var} 保持字面量，立即暴露漏声明
+#     shared  兼容旧行为：所有提取变量写入 session 级全局共享
+#   overwrite: 提取变量遮蔽更低层同名变量时的策略
+#     warn    告警日志（默认，不中断）
+#     fail    直接用例失败
+#     silent  忽略
+variable_scope:
+  mode: strict
+  overwrite: warn
+
 # 日志配置
 log:
   level: "INFO"

@@ -116,6 +116,22 @@ class Config:
         return result
 
     @property
+    def variable_scope_config(self) -> Dict[str, Any]:
+        """变量作用域配置：mode(strict/shared) 与同名覆盖策略 overwrite(warn/fail/silent)"""
+        section = self.raw.get("variable_scope") or {}
+        mode = str(section.get("mode", "strict")).lower()
+        overwrite = str(section.get("overwrite", "warn")).lower()
+        if mode not in ("strict", "shared"):
+            raise ConfigError(
+                f"variable_scope.mode 配置不合法: {section.get('mode')}（支持 strict / shared）"
+            )
+        if overwrite not in ("warn", "fail", "silent"):
+            raise ConfigError(
+                f"variable_scope.overwrite 配置不合法: {section.get('overwrite')}（支持 warn / fail / silent）"
+            )
+        return {"mode": mode, "overwrite": overwrite}
+
+    @property
     def db_config(self) -> Dict[str, Any]:
         """数据库连接配置：优先取环境配置的 db 段，回退到顶层 db 段；无配置返回空字典
 

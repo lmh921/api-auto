@@ -9,7 +9,7 @@
 - **零代码封装**：测试人员只需编写YAML格式测试用例
 - **用例级隔离**：每个YAML测试用例是独立的pytest用例，单条失败不影响其他用例
 - **灵活的断言机制**：支持多种断言类型（状态码、相等、包含等），软断言汇总所有失败项
-- **变量提取与传递**：支持在测试用例间提取和传递变量，保留原始类型
+- **变量提取与传递**：分层变量作用域（用例 > 依赖链上游 > 文件setup > 预置变量），extract 变量沿 `depends_on` 链向下游传递，保留原始类型，同名覆盖自动告警
 - **多环境支持**：`--env` 一键切换环境，正式环境需 `--confirm-prod` 显式确认
 - **文件级setup**：登录等前置步骤写一次，同一文件所有用例复用
 - **自动生成报告**：集成Allure生成美观的测试报告，敏感信息自动脱敏
@@ -44,7 +44,9 @@ ziufileApi/
 │   ├── yaml_parser.py      # YAML解析器（变量替换）
 │   ├── assertion.py        # 断言工具（软断言+JSONPath）
 │   ├── config.py           # 全局配置（多环境+正式环境保护）
-│   ├── case_collector.py   # 用例收集（结构校验+setup注册）
+│   ├── case_collector.py   # 用例收集（结构校验+setup注册+依赖拓扑排序）
+│   ├── dependency.py       # 用例依赖（depends_on判定+run_if条件执行）
+│   ├── variable_scope.py   # 变量作用域（case/链路/文件/session分层+覆盖告警）
 │   ├── step_runner.py      # 步骤执行（env覆盖+文件上传）
 │   ├── setup_runner.py     # 文件级前置步骤
 │   ├── masking.py          # 敏感信息脱敏
@@ -232,7 +234,7 @@ testcases:
         jsonpath: "[0].id"  # JSONPath表达式
         expected: 1  # 期望结果
         message: "检查第一个用户ID"
-    # 变量提取（可选）
+    # 变量提取（可选）：写入本用例作用域，沿 depends_on 链向下游用例传递
     extract:
       first_user_id: "[0].id"  # 提取第一个用户的ID
       first_user_name: "[0].name"  # 提取第一个用户的名称
@@ -246,10 +248,10 @@ description: "用户管理流程测试"
 # 测试标签
 tags: ["用户管理", "流程测试"]
 
-# 全局变量
-global_vars:
-  username: "testuser"
-  password: "testpass123"
+# 预置变量：来自 config.yaml 的 variables 段（全局可见），用例文件内不定义变量
+# variables:
+#   username: "testuser"
+#   password: "testpass123"
 
 # 测试用例列表
 testcases:
@@ -265,15 +267,16 @@ testcases:
       - type: "status_code"
         expected: 200
     extract:
-      token: "data.token"  # 提取登录令牌
+      token: "data.token"  # 提取登录令牌（写入本用例作用域）
 
   # 测试用例2：获取用户信息
   - name: "获取用户信息"
+    depends_on: ["用户登录"]  # ${token} 沿依赖链从上游传递，未声明则不可见
     request:
       method: "GET"
       url: "/user/info"
       headers:
-        Authorization: "Bearer ${token}"  # 使用上一个用例提取的token
+        Authorization: "Bearer ${token}"  # 使用上游用例提取的token
     assertions:
       - type: "status_code"
         expected: 200
@@ -284,7 +287,7 @@ testcases:
 
 ### 6.4 文件级前置步骤（setup）
 
-登录等前置步骤只需在文件顶部写一次，同一文件的所有用例自动复用提取的变量，不再需要每个用例文件重复维护登录用例：
+登录等前置步骤只需在文件顶部写一次，提取的变量写入**文件作用域**（仅本文件用例可见），同一文件的所有用例自动复用，不再需要每个用例文件重复维护登录用例：
 
 ```yaml
 # 文件级前置步骤：在本文件所有用例前执行一次
@@ -415,7 +418,7 @@ testcases:
         column: "role"
         expected: "admin"
 
-    extract_from_db:               # 从库中提取变量（取首行首列），后续用例可用 ${db_user_id}
+    extract_from_db:               # 从库中提取变量（取首行首列），下游依赖用例可用 ${db_user_id}
       db_user_id: "SELECT id FROM t_user WHERE mobile = '${test_mobile}'"
 
     db_teardown:                   # 清理：无论断言成败都执行，防止数据残留
@@ -433,11 +436,11 @@ testcases:
 
 ### 6.10 用例依赖与条件执行（depends_on / run_if）
 
-跨用例传参（`extract` + `${var}`）只解决了"数据从哪来"，`depends_on` / `run_if` 解决"什么时候该执行"：
+跨用例传参（`extract` + `${var}`）只解决了"数据从哪来"，`depends_on` / `run_if` 解决"什么时候该执行"。在 strict 变量作用域下（见 6.11），`depends_on` 同时是**变量传递通道**：
 
-- **显式依赖** `depends_on`：声明的上游用例 failed / skipped / 未执行时，本用例自动 **skip**（带具体原因），不再带着未替换的字面量 `${var}` 发请求产生误导性失败；
+- **显式依赖** `depends_on`：声明的上游用例 failed / skipped / 未执行时，本用例自动 **skip**（带具体原因），不再带着未替换的字面量 `${var}` 发请求产生误导性失败；上游（含传递依赖）的 extract 产物对本用例可见；
 - **可靠执行顺序**：收集期按依赖图**拓扑排序**，生产者一定先于消费者执行，跨文件依赖**不再依赖文件名排序**（无需 `01_`、`02_` 前缀约定）；无依赖关系的用例仍按文件名 + 书写顺序执行，顺序稳定；
-- **条件执行** `run_if`：`global_vars` 中的变量满足条件才执行，不满足时 skip（**不满足不是失败**）。
+- **条件执行** `run_if`：作用域视图中的变量满足条件才执行，不满足时 skip（**不满足不是失败**）。
 
 ```yaml
 testcases:
@@ -455,7 +458,7 @@ testcases:
   - name: "4. 支付订单"
     depends_on: ["3. 创建订单"]
     run_if:                               # 条件执行：商品价格大于0才支付
-      var: sku_price                      # 取自 global_vars（extract/extract_from_db/setup/预置变量）
+      var: sku_price                      # 取自作用域视图（本用例/链路上游/文件setup/预置变量）
       op: gt                              # eq(默认) ne gt ge lt le in not_in contains exists not_exists
       value: 0                            # 支持 ${var} 引用其他变量
     request: { method: "POST", url: "/order/pay" }
@@ -468,8 +471,61 @@ testcases:
 - 收集期校验并给出明确失败原因（转为一条失败用例而非静默丢弃）：**依赖的用例不存在**、**用例名不唯一**（改用 `文件路径::用例名`）、**依赖自身**、**循环依赖**（列出环上所有用例）；
 - 用 `-m` / `-k` 圈选时，若上游被过滤掉未执行，下游会以"依赖的用例 [...] 未执行"skip，而不是报错；
 - `depends_on` / `run_if` 仅对 `testcases` 用例生效，`setup` 步骤中写会直接校验失败；
-- 与 pytest-xdist 并行不兼容（session 级 `global_vars` 的既有约束，非本功能引入）；
+- 与 pytest-xdist 并行不兼容（session 级变量作用域与结果注册表的既有约束，非本功能引入）；
 - 完整示例参考 `data/case_template/dependency_chain_test.yaml`。
+
+### 6.11 变量作用域与同名覆盖（variable_scope）
+
+提取变量按分层作用域管理（实现见 `utils/variable_scope.py`，行为由 `config.yaml` 的 `variable_scope` 段控制）：
+
+| 层级（解析优先级从高到低） | 写入来源 | 可见范围 |
+|--------------------------|---------|---------|
+| 用例作用域 | 用例 `extract` / `extract_from_db` | 本用例，及沿 `depends_on` 依赖链的下游（传递闭包，跨文件依赖同样生效） |
+| 链路上游 | 依赖链上游用例的产出 | 同上，近的上游优先于远的 |
+| 文件作用域 | 文件 `setup` 提取 | 本文件所有用例；`cache: true` 命中时导入目标文件的文件层 |
+| session 预置 | `config.yaml` 的 `variables` 段 | 所有用例 |
+
+- **strict 模式（默认）**：未声明 `depends_on` 却引用上游变量时，`${var}` 保持字面量原样发出，立即暴露漏声明的依赖；无依赖关系的用例之间互不可见，彻底消除跨用例串扰；
+- **shared 模式**（兼容旧行为）：`mode: shared` 时所有提取变量写入 session 级全局共享；
+- **同名覆盖检测**：提取变量遮蔽更低层同名变量时按 `overwrite` 策略处理——`warn`（默认，告警日志注明来源层）/ `fail`（用例直接失败）/ `silent`；同一用例内重复提取同名变量不算覆盖；
+- 变量生命周期不再贯穿整个 session：用例作用域变量只在其依赖链内可见，未入链的产物在用例结束后自然"失效"。
+
+```yaml
+# config/config.yaml
+variable_scope:
+  mode: strict        # strict（默认）/ shared
+  overwrite: warn     # warn / fail / silent
+```
+
+### 6.12 内置造数函数（随机数据）
+
+在请求参数、URL、断言期望值、`db_setup` / `db_assertions` / `db_teardown` 的 SQL 中直接内联生成随机数据，唯一性不再依赖前置接口或 DB 准备：
+
+| 函数 | 示例 | 说明 |
+|------|------|------|
+| `uuid()` | `"${uuid()}"` | 随机 UUID4 字符串 |
+| `timestamp()` | `"${timestamp()}"` | 当前毫秒级时间戳（整串占位符保留 int 类型） |
+| `rand_str(长度)` | `"${rand_str(8)}"` | 字母+数字随机串，缺省长度 8（1~128） |
+| `rand_mobile()` | `"${rand_mobile()}"` | 11位随机手机号（`1[3-9]` 号段） |
+| `rand_int(最小, 最大)` | `"${rand_int(1, 100)}"` | 区间内随机整数（含边界，整串占位符保留 int 类型） |
+
+```yaml
+db_setup:
+  - "INSERT INTO t_user (mobile, token) VALUES ('${rand_mobile()}', '${uuid()}')"
+db_assertions:
+  - type: "row_count"
+    sql: "SELECT id FROM t_user WHERE mobile = '${rand_mobile()}'"   # 与造数是同一个值
+    op: "=="
+    expected: 1
+```
+
+**规则说明**：
+
+- **用例内稳定**：同一用例（或同一文件 setup）内相同表达式返回相同值，跨用例自动重新生成——保证 `db_setup` 造数 → `db_assertions` 校验 → `db_teardown` 清理引用同一份数据；
+- 参数支持数字/字符串字面量，不做动态求值；函数名只按白名单分发（`utils/yaml_parser.py` 的 `BUILTIN_FUNCTIONS`），未按任何用户输入执行代码；
+- 未知函数名 / 参数不合法 / 执行出错：打 WARNING 并保留原文 `${...}`（不静默、不中断）；
+- 变量优先：若 `variables` 段定义了与函数同名的变量（如 `uuid()`），变量生效；
+- 大批量造数如需更强唯一性，可组合使用（如 `"${timestamp()}_${rand_str(4)}"`）。
 
 ## 7. 运行测试
 

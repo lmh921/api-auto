@@ -35,7 +35,7 @@ assertions:
     expected: "Test"
     message: "检查用户名包含Test"
 
-# 变量提取（用于后续接口调用）
+# 变量提取（写入本用例作用域，沿 depends_on 链向下游用例传递）
 extract:
   token: "data.token"
   user_id: "data.id"

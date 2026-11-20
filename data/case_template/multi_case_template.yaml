@@ -40,6 +40,7 @@ testcases:
   # 第二个测试用例：获取用户信息接口（依赖登录获取的token）
   - name: "获取用户信息接口测试"
     description: "测试获取用户信息功能"
+    depends_on: ["登录接口测试"]   # ${token}/${user_id} 沿依赖链从上游传递（strict作用域）
     request:
       method: "GET"
       url: "/users/${user_id}"
@@ -62,6 +63,7 @@ testcases:
   # 第三个测试用例：退出登录接口
   - name: "退出登录接口测试"
     description: "测试退出登录功能"
+    depends_on: ["登录接口测试"]   # ${token} 来自直接上游；未声明依赖的变量不可见
     request:
       method: "POST"
       url: "/logout"

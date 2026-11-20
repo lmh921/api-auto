@@ -32,15 +32,15 @@ testcases:
     extract:
       request_url: "url"
 
-  # 2. 响应包含测试
+  # 2. 响应包含测试（含内置造数函数演示）
   - name: "模拟响应包含测试"
-    description: "测试断言包含功能"
+    description: "测试断言包含功能与 ${rand_*} 内置造数函数"
     tags: ["POST", "包含"]
     request:
       method: "POST"
       url: "https://httpbin.org/post"
       json:
-        username: "admin"
+        username: "user_${rand_str(6)}"    # 内置函数：同一用例内相同表达式结果稳定，断言可直接引用
         password: "123456"
     assertions:
       - type: "status_code"
@@ -48,7 +48,7 @@ testcases:
         message: "检查响应状态码"
       - type: "contains"
         jsonpath: "json.username"
-        expected: "admin"
+        expected: "user_${rand_str(6)}"    # 与请求中的表达式求值一致（用例内缓存）
         message: "检查响应包含username"
       - type: "contains"
         jsonpath: "headers.Content-Type"

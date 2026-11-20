@@ -42,10 +42,10 @@ def _open_files(files_spec: Dict[str, Any], base_dir: Path) -> Tuple[Dict[str, A
     return files, handles
 
 
-def prepare_step(step: Dict[str, Any], global_vars: dict, yaml_parser: YamlParser,
+def prepare_step(step: Dict[str, Any], variables: dict, yaml_parser: YamlParser,
                  base_dir: Path) -> Dict[str, Any]:
-    """准备一个步骤：变量替换、组装requests参数（files此时才打开文件句柄）"""
-    request_data = yaml_parser.replace_variables(step.get("request") or {}, global_vars)
+    """准备一个步骤：变量替换（传入作用域视图）、组装requests参数（files此时才打开文件句柄）"""
+    request_data = yaml_parser.replace_variables(step.get("request") or {}, variables)
     method = str(request_data.get("method", "GET")).upper()
     url = str(request_data.get("url", ""))
 

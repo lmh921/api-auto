@@ -10,6 +10,7 @@ from utils import setup_runner
 from utils.config import PROJECT_ROOT, get_config
 from utils.masking import mask_data, register_extracted
 from utils.step_runner import cleanup_step, prepare_step, send_prepared
+from utils.yaml_parser import clear_function_scope, set_function_scope
 
 
 def _require_db(db_client, case_name: str):
@@ -22,11 +23,11 @@ def _require_db(db_client, case_name: str):
         )
 
 
-def _run_db_statements(db_client, statements, yaml_parser, global_vars, step_label: str):
+def _run_db_statements(db_client, statements, yaml_parser, variables, step_label: str):
     """执行一组SQL语句（db_setup/db_teardown），支持字符串或{sql: ...}两种写法"""
     for index, statement in enumerate(statements, 1):
         sql = statement.get("sql") if isinstance(statement, dict) else statement
-        sql = yaml_parser.replace_variables(sql, global_vars)
+        sql = yaml_parser.replace_variables(sql, variables)
         with allure.step(f"{step_label} #{index}"):
             affected = db_client.execute(sql)
             allure.attach(sql, "SQL", allure.attachment_type.TEXT)
@@ -34,7 +35,7 @@ def _run_db_statements(db_client, statements, yaml_parser, global_vars, step_lab
 
 
 def test_api_executor(case_file: str, case: dict, case_id: str,
-                      yaml_parser, http_client, assertion, global_vars, db_client):
+                      yaml_parser, http_client, assertion, variable_scope, db_client):
     """API测试执行器：每个YAML测试用例作为独立的pytest用例执行
 
     执行顺序：依赖判定(depends_on) -> 条件判定(run_if) -> 文件级setup -> db_setup
@@ -47,7 +48,7 @@ def test_api_executor(case_file: str, case: dict, case_id: str,
     避免带着未替换的字面量 "${var}" 发请求产生误导性失败。
     """
     try:
-        _execute_case(case_file, case, yaml_parser, http_client, assertion, global_vars, db_client)
+        _execute_case(case_file, case, case_id, yaml_parser, http_client, assertion, variable_scope, db_client)
         dependency.record_result(case_id, "passed")
     except pytest.skip.Exception:
         dependency.record_result(case_id, "skipped")
@@ -57,12 +58,30 @@ def test_api_executor(case_file: str, case: dict, case_id: str,
         raise
 
 
-def _execute_case(case_file: str, case: dict,
-                  yaml_parser, http_client, assertion, global_vars, db_client):
-    """单条用例的执行主体（结果登记见 test_api_executor）"""
+def _execute_case(case_file: str, case: dict, case_id: str,
+                  yaml_parser, http_client, assertion, variable_scope, db_client):
+    """单条用例的执行主体（结果登记见 test_api_executor）
+
+    变量作用域：用例开始 set_context、结束 clear_context；提取变量写入 case 层，
+    ${var} 替换基于 variable_scope.view()（case > 链路上游 > 文件setup > session），
+    setup 提取会动态更新文件层，各消费点实时取视图（见 utils/variable_scope.py）。
+    """
     if "_collect_error" in case:
         pytest.fail(f"用例收集失败: {case['_collect_error']}")
 
+    # 变量上下文 + 造数函数作用域（同一用例内 ${uuid()} 等表达式结果稳定，跨用例重新生成）
+    variable_scope.set_context(case_id, case_file)
+    set_function_scope(case_id)
+    try:
+        _run_case(case_file, case, case_id, yaml_parser, http_client, assertion, variable_scope, db_client)
+    finally:
+        clear_function_scope()
+        variable_scope.clear_context()
+
+
+def _run_case(case_file: str, case: dict, case_id: str,
+              yaml_parser, http_client, assertion, variable_scope, db_client):
+    """用例执行步骤（变量上下文由 _execute_case 管理）"""
     # 依赖判定：上游 failed/skipped/未执行 时本用例 skip（原因见 utils/dependency.py）
     dep_reason = dependency.check_dependencies(case)
     if dep_reason:
@@ -71,7 +90,7 @@ def _execute_case(case_file: str, case: dict,
 
     # 条件执行判定：run_if 不满足时本用例 skip（不满足不是失败）
     if case.get("run_if"):
-        cond_reason = dependency.evaluate_run_if(case["run_if"], global_vars, yaml_parser)
+        cond_reason = dependency.evaluate_run_if(case["run_if"], variable_scope.view(), yaml_parser)
         if cond_reason:
             logger.info(f"条件不满足，跳过用例: {cond_reason}")
             pytest.skip(cond_reason)
@@ -89,26 +108,29 @@ def _execute_case(case_file: str, case: dict,
 
     # 文件级前置步骤（同一文件只执行一次；失败则该文件所有用例失败并给出原因）
     with allure.step("执行文件前置步骤(setup)"):
-        setup_error = setup_runner.ensure_setup(case_file, global_vars, http_client, assertion, yaml_parser)
+        setup_error = setup_runner.ensure_setup(case_file, variable_scope, http_client, assertion, yaml_parser)
     if setup_error:
         pytest.fail(setup_error)
 
+    # setup 执行期间造数函数作用域切到了文件域，此处切回用例域
+    set_function_scope(case_id)
+
     # 变量替换：断言期望值支持 ${var}，整串占位符保留原始类型
-    assertions = yaml_parser.replace_variables(case.get("assertions") or [], global_vars)
+    assertions = yaml_parser.replace_variables(case.get("assertions") or [], variable_scope.view())
     case_dir = (PROJECT_ROOT / case_file).parent
 
     # DB前置（数据准备/建表等）
     if case.get("db_setup"):
         _require_db(db_client, case_name)
         with allure.step("执行数据库前置(db_setup)"):
-            _run_db_statements(db_client, case["db_setup"], yaml_parser, global_vars, "DB前置")
+            _run_db_statements(db_client, case["db_setup"], yaml_parser, variable_scope.view(), "DB前置")
 
     response = None
     teardown_error = None
     try:
         # 准备并发送请求（纯数据库校验用例可无request；files文件句柄在发送前打开，无论成败都关闭）
         if isinstance(case.get("request"), dict):
-            prep = prepare_step(case, global_vars, yaml_parser, case_dir)
+            prep = prepare_step(case, variable_scope.view(), yaml_parser, case_dir)
             try:
                 with allure.step(f"发送{prep['method']}请求到 {prep['url']}"):
                     # 附件经过脱敏，避免token/手机号等明文进入报告
@@ -136,7 +158,7 @@ def _execute_case(case_file: str, case: dict,
         if case.get("db_assertions"):
             _require_db(db_client, case_name)
             with allure.step("执行数据库校验(db_assertions)"):
-                db_assertions = yaml_parser.replace_variables(case["db_assertions"], global_vars)
+                db_assertions = yaml_parser.replace_variables(case["db_assertions"], variable_scope.view())
                 try:
                     assertion.run_db_assertions(db_client, db_assertions)
                 finally:
@@ -148,29 +170,30 @@ def _execute_case(case_file: str, case: dict,
                     except Exception:
                         pass
 
-        # 提取接口变量（写入session级global_vars，供后续用例通过 ${var} 引用；提取值脱敏后进报告）
+        # 提取接口变量（写入用例作用域：strict模式下沿 depends_on 链向下游传播；提取值脱敏后进报告）
         if case.get("extract") and response is not None:
             with allure.step("提取变量"):
                 for var_name, jsonpath in case["extract"].items():
                     var_value = assertion.get_value_from_jsonpath(response["body"], jsonpath)
-                    global_vars[var_name] = var_value
+                    scope_label = variable_scope.extract(var_name, var_value)
                     # 敏感变量（token/手机号等）注册到文本替换表，后续日志中自动脱敏
                     register_extracted({var_name: var_value})
                     masked_value = mask_data({var_name: var_value})[var_name]
-                    logger.info(f"成功提取变量: {var_name} = {masked_value}")
-                    allure.attach(f"{var_name} = {masked_value}", "提取的变量", allure.attachment_type.TEXT)
+                    logger.info(f"成功提取变量: {var_name} = {masked_value}（写入{scope_label}）")
+                    allure.attach(f"{var_name} = {masked_value}（写入{scope_label}）", "提取的变量",
+                                  allure.attachment_type.TEXT)
 
         # 从数据库提取变量（var -> SQL，取首行首列）
         if case.get("extract_from_db"):
             _require_db(db_client, case_name)
             with allure.step("从数据库提取变量(extract_from_db)"):
                 for var_name, sql in case["extract_from_db"].items():
-                    sql = yaml_parser.replace_variables(sql, global_vars)
+                    sql = yaml_parser.replace_variables(sql, variable_scope.view())
                     var_value = db_client.query_value(sql)
-                    global_vars[var_name] = var_value
+                    scope_label = variable_scope.extract(var_name, var_value)
                     register_extracted({var_name: var_value})
                     masked_value = mask_data({var_name: var_value})[var_name]
-                    logger.info(f"成功从数据库提取变量: {var_name} = {masked_value}")
+                    logger.info(f"成功从数据库提取变量: {var_name} = {masked_value}（写入{scope_label}）")
                     allure.attach(f"{var_name} = {masked_value}\nSQL: {sql}", "数据库提取变量",
                                   allure.attachment_type.TEXT)
 
@@ -181,7 +204,7 @@ def _execute_case(case_file: str, case: dict,
             if db_client is not None:
                 try:
                     with allure.step("执行数据库清理(db_teardown)"):
-                        _run_db_statements(db_client, case["db_teardown"], yaml_parser, global_vars, "DB清理")
+                        _run_db_statements(db_client, case["db_teardown"], yaml_parser, variable_scope.view(), "DB清理")
                 except Exception as e:
                     teardown_error = str(e)
                     logger.error(f"db_teardown执行失败: {teardown_error}")

@@ -33,6 +33,7 @@ testcases:
   # 2. 获取单个用户
   - name: "获取单个用户信息"
     description: "测试GET /users/{id}接口获取单个用户信息"
+    depends_on: ["获取用户列表"]     # ${first_user_id}/${first_user_name} 沿依赖链从上游传递
     tags: ["GET", "用户管理"]
     request:
       method: "GET"
@@ -90,6 +91,7 @@ testcases:
   # 4. 更新用户
   - name: "更新用户信息"
     description: "测试PUT /users/{id}接口更新用户信息"
+    depends_on: ["创建新用户"]       # ${new_user_id} 沿依赖链从上游传递
     tags: ["PUT", "用户管理"]
     request:
       method: "PUT"
@@ -115,7 +117,8 @@ testcases:
 
   # 5. 删除用户
   - name: "删除用户"
-    description: "测试DELETE /users/{id}接口删除用户"
+    description: "测试DELETE /users/{id}接口删除用户信息"
+    depends_on: ["更新用户信息"]     # 上游 passed 才执行；${new_user_id} 经依赖链传递可见
     tags: ["DELETE", "用户管理"]
     request:
       method: "DELETE"

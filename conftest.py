@@ -9,6 +9,7 @@ from utils.config import get_config
 from utils.case_collector import build_case_ids, collect_all_cases
 from utils.dependency import CASE_RESULTS
 from utils.masking import MaskedDict, redact_text, register_extracted
+from utils.variable_scope import VariableScopes, build_upstream_map
 
 # 以本文件位置定位项目根目录，避免依赖启动时的当前工作目录
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -66,6 +67,8 @@ def pytest_generate_tests(metafunc):
     ids = build_case_ids(entries)
     # 收集先于执行，此处清空依赖结果注册表是安全的（同进程重复调用pytest时防串场）
     CASE_RESULTS.clear()
+    # 重建依赖闭包表（case_id -> 传递上游，strict作用域的链路变量传播依据）
+    build_upstream_map(entries, ids)
     known_markers = {m.split(":", 1)[0].strip() for m in metafunc.config.getini("markers")}
 
     params = []
@@ -79,14 +82,19 @@ def pytest_generate_tests(metafunc):
 
 
 @pytest.fixture(scope="session")
-def global_vars():
-    """全局变量fixture：预置配置 variables 段（支持 $ENV{名称} 引用环境变量）
+def variable_scope():
+    """变量作用域管理器（session级）：分层命名空间 case > 链路上游 > 文件setup > session
 
-    使用MaskedDict包装：repr脱敏，避免pytest失败回显泄漏明文
+    预置配置 variables 段写入 session 层（支持 $ENV{名称} 引用环境变量）；
+    extract / extract_from_db / setup 提取按 variable_scope 配置写入对应层，
+    模式与覆盖策略见 config.yaml 的 variable_scope 段（utils/variable_scope.py）
     """
-    variables = get_config().variables
-    register_extracted(variables)
-    return MaskedDict(variables)
+    config = get_config()
+    scope_config = config.variable_scope_config
+    scopes = VariableScopes(mode=scope_config["mode"], overwrite=scope_config["overwrite"])
+    scopes.init_session(config.variables)
+    register_extracted(config.variables)
+    return scopes
 
 @pytest.fixture(scope="function")
 def http_client():

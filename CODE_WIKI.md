@@ -147,19 +147,21 @@ pytest 启动
   → conftest.pytest_generate_tests
        → get_config()                    加载环境并校验正式环境保护
        → collect_all_cases()             扫描用例目录 + 结构校验 + 注册 FILE_SETUPS
+       → build_case_ids() + build_upstream_map()   用例ID + 依赖闭包表（链路变量传播依据）
        → parametrize("case_file,case")  每一条用例独立参数化 + tag→marker 映射
   → conftest.clear_allure_results        session 级清理
   → 对每个参数化用例：
-       → test_api_executor(case_file, case, yaml_parser, http_client, assertion, global_vars)
+       → test_api_executor(case_file, case, case_id, yaml_parser, http_client, assertion, variable_scope)
             → allure 动态打标
+            → variable_scope.set_context   进入用例作用域上下文（结束 clear_context）
             → setup_runner.ensure_setup  文件级setup（首次触发，支持缓存）
                  → prepare_step → send_prepared → cleanup_step
-                 → run_assertions → extract → register_extracted
-            → prepare_step(case)         变量替换 + 组装files
+                 → run_assertions → extract 写文件作用域层 → register_extracted
+            → prepare_step(case)         变量替换（variable_scope.view()） + 组装files
             → send_prepared(case)        发送 + env覆盖
             → cleanup_step               恢复env + 关闭文件句柄
             → assertion.run_assertions   软断言
-            → extract 写 global_vars     + 注册脱敏
+            → variable_scope.extract     写入用例作用域层（沿 depends_on 链传播）+ 注册脱敏
   → (可选) result_summary.py             解析 allure-results → 邮件正文/附件
 ```
 
@@ -193,12 +195,14 @@ ziufileApi/
 │   ├── multi_case_template.yaml    # 多接口用例模板（含全局变量注释）
 │   └── single_case_template.yaml   # 单接口用例模板
 │
-├── utils/                          # 核心模块（10 个子模块）
-│   ├── config.py                   # 全局配置：多环境/正式环境保护/预置变量/DB配置
+├── utils/                          # 核心模块（12 个子模块）
+│   ├── config.py                   # 全局配置：多环境/正式环境保护/预置变量/变量作用域/DB配置
 │   ├── http_client.py              # HTTP 客户端：幂等重试策略
 │   ├── yaml_parser.py              # YAML 解析 + ${var} 变量替换（保留类型）
 │   ├── assertion.py                # 软断言 + JSONPath 取值引擎 + DB断言
-│   ├── case_collector.py           # 用例发现 / jsonschema 校验 / setup 注册 / 用例ID
+│   ├── case_collector.py           # 用例发现 / jsonschema 校验 / setup 注册 / 依赖拓扑排序 / 用例ID
+│   ├── dependency.py               # depends_on 判定 / run_if 条件执行 / 结果注册表
+│   ├── variable_scope.py           # 变量作用域：case/链路/文件/session 分层 + 同名覆盖告警
 │   ├── step_runner.py              # 单步骤准备-发送-清理三件套
 │   ├── setup_runner.py             # 文件级 setup 执行 + 跨文件缓存
 │   ├── masking.py                  # 三层脱敏：字典/Repr/文本替换
@@ -333,6 +337,7 @@ variables:
 - 加载并解析 YAML 用例文件
 - 兼容两种 YAML 组织形式：单接口用例（顶层含 `name/request`）与多接口集合（顶层 `testcases: []`）
 - 递归做 `${var}` 变量替换；**整串占位符保留原始类型**（数字/布尔/字典/列表不会转字符串）
+- **内置造数函数**：`${uuid()}` / `${timestamp()}` / `${rand_str(8)}` / `${rand_mobile()}` / `${rand_int(1,100)}`，白名单分发 + 字面量参数解析（不做动态代码执行）
 
 #### 关键类 `YamlParser`
 
@@ -342,12 +347,13 @@ variables:
 | `parse_test_cases` | `(file_path: str) -> List[dict]` | 统一返回用例列表；自动识别单接口/多接口形式 |
 | `replace_variables` | `(data: Any, variables: dict) -> Any` | 递归：字符串 / dict / list 替换变量；其他类型原样返回 |
 | `_replace_in_string` | `(text: str, variables: dict) -> Any` | 单个字符串：整串占位符保留类型，嵌入占位符做 `sub` |
+| `_resolve_placeholder` / `_eval_builtin_function` | 内部 | 变量优先 → 内置函数求值 → 都未命中保留原文 |
 
 #### 变量替换规则（核心设计）
 
 ```python
 # 规则1：整串占位符 → 保留原始类型
-expected: "${user_id}"    # 若 global_vars["user_id"] = 123 (int) → 结果为 123 int
+expected: "${user_id}"    # 若作用域视图 view()["user_id"] = 123 (int) → 结果为 123 int
                           # 避免 "123" != 123 的断言误判
 
 # 规则2：嵌入占位符 → 字符串插值
@@ -355,13 +361,19 @@ Authorization: "Bearer ${token}"   # → "Bearer xxxx"
 
 # 规则3：未定义变量 → 保留原文 + DEBUG 日志
 url: "/users/${undefined_var}"     # → "/users/${undefined_var}"
+
+# 规则4：内置函数 → 白名单求值；未知函数/坏参数 → WARNING + 保留原文
+json: { mobile: "${rand_mobile()}" }   # 同一用例内相同表达式结果一致（用例内缓存）
 ```
 
-#### 常量
+#### 常量与生成值作用域
 
-| 常量 | 正则 | 说明 |
-|------|------|------|
-| `VAR_PATTERN` | `\$\{([^}]+)\}` | `${var}` 占位符 |
+| 常量 | 正则/说明 |
+|------|------|
+| `VAR_PATTERN` | `\$\{([^}]+)\}` 占位符 |
+| `FUNC_PATTERN` | `^([a-zA-Z_][a-zA-Z0-9_]*)\((.*)\)$` 内置函数语法 |
+| `BUILTIN_FUNCTIONS` | 函数白名单：uuid / timestamp / rand_str / rand_mobile / rand_int |
+| `set_function_scope(owner)` / `clear_function_scope()` | 生成值缓存作用域：同一 owner（用例ID 或 `setup::文件`）内相同表达式返回同值，owner 变化即重置；test_executor / setup_runner 在用例与 setup 边界调用 |
 
 ---
 
@@ -519,7 +531,7 @@ def run_db_assertions(self, db_client, db_assertions: List[Dict]) -> None:
 | 函数 | 签名 | 说明 |
 |------|------|------|
 | `_open_files(files_spec, base_dir)` | `(dict, Path) -> (dict, List[handle])` | 解析 YAML `files` → requests 格式；打开文件句柄；优先相对用例目录解析路径，不存在则回退项目根 |
-| `prepare_step(step, global_vars, yaml_parser, base_dir)` | 核心：变量替换 + 组装 requests kwargs + 打开 files + 返回 attach_kwargs（报告用，内容是路径不包含句柄） |
+| `prepare_step(step, variables, yaml_parser, base_dir)` | 核心：变量替换（传入作用域视图） + 组装 requests kwargs + 打开 files + 返回 attach_kwargs（报告用，内容是路径不包含句柄） |
 | `send_prepared(prep, step, http_client)` | 临时覆盖 `http_client.base_url / timeout`（若用例 env 段指定）→ 调用 `http_client.request` |
 | `cleanup_step(prep, http_client)` | 恢复被覆盖的 base_url/timeout；关闭所有文件句柄；多次调用安全 |
 
@@ -552,9 +564,9 @@ files:
 #### 职责
 
 - 同一用例文件的 setup **只执行一次**（挂在该文件的**第一条用例**上执行）
-- 执行成功：提取的变量写入 `global_vars`，注册脱敏 → 本文件所有用例可用
+- 执行成功：提取的变量写入**文件作用域层**（variable_scope，逐条即时写入，后续 setup 步骤可引用前面步骤的变量），注册脱敏 → 本文件所有用例可用
 - 执行失败：该文件的后续所有用例直接失败，原因来自 `_setup_failed[case_file]`
-- 跨文件缓存（`cache: true`）：**相同 steps 内容 + 相同 base_url** → 用签名命中缓存跳过执行
+- 跨文件缓存（`cache: true`）：**相同 steps 内容 + 相同 base_url** → 用签名命中缓存跳过执行，命中时把缓存变量导入目标文件的文件层
 - 步骤断言 + 变量提取完全复用 `assertion` / `step_runner`
 
 #### 全局状态（模块级）
@@ -569,14 +581,14 @@ files:
 
 | 函数 | 签名 | 说明 |
 |------|------|------|
-| `ensure_setup(case_file, global_vars, http_client, assertion, yaml_parser) -> Optional[str]` | 返回 `None` 成功；返回 str = 错误信息；失败会写入 `_setup_failed`，后续同文件用例直接拿缓存错误 |
+| `ensure_setup(case_file, variable_scope, http_client, assertion, yaml_parser) -> Optional[str]` | 返回 `None` 成功；返回 str = 错误信息；失败会写入 `_setup_failed`，后续同文件用例直接拿缓存错误 |
 
 **执行顺序**：
 1. `spec = FILE_SETUPS.get(case_file)` 不存在 / 已 done → 跳过
-2. 计算签名 → 命中缓存且 `cache: true` → `global_vars.update(缓存)` → done
-3. 依次执行 steps：`prepare_step` → `send_prepared` → `cleanup_step`
-4. 执行断言（如有）→ 提取变量 → `register_extracted` 注册脱敏
-5. 成功 → `_done_files`；失败 → `_setup_failed[case_file] = error`
+2. 计算签名 → 命中缓存且 `cache: true` → `variable_scope.import_file_layer(缓存)` → done
+3. 依次执行 steps（视图 `variable_scope.view()` 按步骤实时获取）：`prepare_step` → `send_prepared` → `cleanup_step`
+4. 执行断言（如有）→ 提取变量写文件层 → `register_extracted` 注册脱敏
+5. 成功 → `_done_files`（cache 时存 `_setup_cache`）；失败 → `_setup_failed[case_file] = error`
 
 > 注意：业务会改变账号状态（如注销登录）时务必不要开启 `cache: true`，否则后续文件会拿到失效 token。
 
@@ -591,7 +603,7 @@ files:
 | 层级 | 实现 | 作用于 | 效果 |
 |------|------|--------|------|
 | 第1层 | `mask_data(data)` | 结构化字典/列表（请求参数、响应体、Allure 附件） | 深拷贝后替换敏感键值为 `******` |
-| 第2层 | `MaskedDict(dict)` | pytest 失败回显 / Allure 参数记录（global_vars、case 参数） | `__repr__` 输出时调用 mask_data |
+| 第2层 | `MaskedDict(dict)` | pytest 失败回显 / Allure 参数记录（case 参数） | `__repr__` 输出时调用 mask_data |
 | 第3层 | `register_secret / redact_text` + loguru patcher | 任意日志文本、断言消息等非结构化输出 | 全文替换已注册敏感值 |
 
 #### 敏感键集合
@@ -691,7 +703,7 @@ files:
 
 - 维护 **session 级用例结果注册表** `CASE_RESULTS`：`case_id基名 → "passed" / "failed" / "skipped"`，由 test_executor 在用例结束时写入
 - **depends_on 判定**：上游 failed / skipped / 未执行（被 `-m`/`-k` 过滤）→ 下游 `pytest.skip` 并给出具体原因，避免带着字面量 `${var}` 产生误导性失败
-- **run_if 求值**：对 `global_vars` 中的变量按比较符判定，不满足 → skip（不是失败）
+- **run_if 求值**：对作用域视图（`variable_scope.view()`）中的变量按比较符判定，不满足 → skip（不是失败）
 
 #### 常量与注册表
 
@@ -706,13 +718,52 @@ files:
 |------|------|------|
 | `record_result(case_id, status)` | `(str, str) -> None` | 用例结束时登记结果（test_executor 的 try/except 全路径调用） |
 | `check_dependencies(case)` | `(dict) -> Optional[str]` | 返回 None=依赖满足；返回 str=应 skip 的原因（引用已在收集期规范化） |
-| `evaluate_run_if(run_if, global_vars, yaml_parser)` | `(dict, dict, YamlParser) -> Optional[str]` | 返回 None=条件满足；`value` 支持 `${var}`；实际值进报告前脱敏 |
+| `evaluate_run_if(run_if, variables, yaml_parser)` | `(dict, dict, YamlParser) -> Optional[str]` | 返回 None=条件满足；`variables` 为当前用例的作用域视图；`value` 支持 `${var}`；实际值进报告前脱敏 |
 | `_to_number(value)` / `_compare(actual, op, expected)` | 内部 | 数值转换（bool 视为非数值，避免 `True == 1` 意外匹配）与比较实现 |
 
 > 设计要点：
-> - 注册表只支持单进程（pytest-xdist 与 session 级 `global_vars` 本就不兼容，既有约束）。
+> - 注册表只支持单进程（pytest-xdist 与 session 级变量作用域本就不兼容，既有约束）。
 > - skip 语义为强依赖且**沿链传播**：A 失败 → B skip → 依赖 B 的 C 也 skip。
 > - 收集期已拓扑排序，整批执行时读到的一定是上游最终结果；"未执行"分支仅在上游被圈选过滤时出现。
+> - `depends_on` 在 strict 变量作用域下同时是变量传递通道（见 [4.12 variable_scope 模块](#412-variable_scopepy--变量作用域)）。
+
+---
+
+### 4.12 variable_scope.py · 变量作用域
+
+**文件**：[utils/variable_scope.py](file:///d:/pythontest/ziufileApi/utils/variable_scope.py)
+
+#### 职责
+
+解决原先所有提取变量静默写入 session 级单一 `global_vars` 带来的同名覆盖无告警、生命周期贯穿 session、跨用例跨文件串扰问题。
+
+**层级与解析优先级**（`view()` 从低到高逐层合并，近者优先）：
+
+| 层级 | 写入来源 | 可见范围 |
+|------|---------|---------|
+| `session` | config `variables` 段预置 | 所有用例 |
+| `file:<文件路径>` | 文件 setup 提取（逐条即时写入） | 本文件用例；`cache: true` 命中时导入目标文件层 |
+| `chain` | 依赖闭包内上游用例产出 | 仅 depends_on 链上的下游可见（传递闭包，近的上游优先于远的） |
+| `case:<用例ID>` | 用例 extract / extract_from_db | 本用例 |
+
+#### 模式与覆盖策略（config.yaml `variable_scope` 段）
+
+| 配置 | 取值 | 说明 |
+|------|------|------|
+| `mode` | `strict`（默认） | extract 产物仅本用例可见，沿 depends_on 链传播；未声明依赖引用上游变量 → `${var}` 保持字面量暴露漏声明 |
+| | `shared` | 兼容旧行为：提取变量写入 session 层全局共享 |
+| `overwrite` | `warn`（默认）/ `fail` / `silent` | 写入遮蔽更低层同名变量（使其在解析中不可达）时的策略；同层内重写不算覆盖 |
+
+#### 注册表与关键 API
+
+| 名称 | 签名 | 说明 |
+|------|------|------|
+| `UPSTREAM_MAP` | `Dict[case_id, List[case_id]]` | 依赖闭包表；`build_upstream_map(entries, ids)` 在收集期构建（输入为 resolve_and_sort 产出的拓扑序 + 规范引用） |
+| `VariableScopes(mode, overwrite)` | 构造 | session fixture 持有；`init_session(variables)` 预置 session 层 |
+| `set_context(case_id, case_file)` / `clear_context()` | — | 用例执行上下文（test_executor 进入/退出） |
+| `view() -> dict` | — | 当前上下文的扁平变量视图；setup 阶段按消费点实时获取 |
+| `extract(name, value, layer="case"\|"file") -> str` | — | 写入对应层并做覆盖检测，返回作用域标签供日志使用；`fail` 策略抛 `VariableOverwriteError` |
+| `import_file_layer(case_file, variables)` | — | setup 缓存导入（按设计共享，不做覆盖检测） |
 
 ---
 
@@ -728,13 +779,13 @@ files:
 |------|------|
 | **日志初始化**（模块顶层） | `logger.remove() → logger.configure(patcher=redact_text)` → 双 sink：文件（100MB 滚动 / 7天保留）+ 控制台彩色输出 |
 | `pytest_addoption(parser)` | 注册自定义组 `ziufile-api`：<br>`--env`（环境名）、`--confirm-prod`（正式环境确认开关） |
-| `pytest_generate_tests(metafunc)` | 核心：只对 `case` fixture 生效 → 调用 `collect_all_cases`（含 depends_on 解析+拓扑排序）+ `build_case_ids` → 清空 `CASE_RESULTS`（收集先于执行，安全）→ 用 `pytest.param(rel_path, MaskedDict(case), case_id, id=..., marks=...)` 三值参数化（case_id 透传给执行器登记结果）。<br>**tags → markers 映射**：用例 tags 与 pytest.ini 中注册的 marker 同名者自动挂对应 pytest mark，支持 `-m smoke` 圈选。<br>**MaskedDict**：参数对象 repr 脱敏，防止 pytest 失败回显/Allure 参数泄漏。 |
+| `pytest_generate_tests(metafunc)` | 核心：只对 `case` fixture 生效 → 调用 `collect_all_cases`（含 depends_on 解析+拓扑排序）+ `build_case_ids` → 清空 `CASE_RESULTS` + `build_upstream_map`（依赖闭包表，收集先于执行，安全）→ 用 `pytest.param(rel_path, MaskedDict(case), case_id, id=..., marks=...)` 三值参数化（case_id 透传给执行器登记结果）。<br>**tags → markers 映射**：用例 tags 与 pytest.ini 中注册的 marker 同名者自动挂对应 pytest mark，支持 `-m smoke` 圈选。<br>**MaskedDict**：参数对象 repr 脱敏，防止 pytest 失败回显/Allure 参数泄漏。 |
 
 #### Fixtures
 
 | Fixture | Scope | 说明 |
 |---------|-------|------|
-| `global_vars` | **session** | 来自 `get_config().variables`（含 `$ENV{}` 展开），`MaskedDict` 包装；用例间通过 extract 写入实现变量传递 |
+| `variable_scope` | **session** | `VariableScopes` 实例（模式/覆盖策略来自 `get_config().variable_scope_config`）；预置变量写入 session 层并注册脱敏；用例间通过 case/链路/文件分层实现变量传递（见 4.12） |
 | `http_client` | **function** | 每个用例独立实例，避免 case 级 `env` 覆盖相互污染；结束自动 `session.close()` |
 | `yaml_parser` | function | YamlParser 实例 |
 | `assertion` | function | Assertion 实例 |
@@ -747,7 +798,7 @@ files:
 
 **文件**：[testcases/test_executor.py](file:///d:/pythontest/ziufileApi/testcases/test_executor.py)
 
-#### `test_api_executor(case_file, case, case_id, yaml_parser, http_client, assertion, global_vars, db_client)`
+#### `test_api_executor(case_file, case, case_id, yaml_parser, http_client, assertion, variable_scope, db_client)`
 
 **执行顺序**：依赖判定(depends_on) → 条件判定(run_if) → 文件级 setup → `db_setup` → 请求(可选) → 接口断言(可选) → `db_assertions` → `extract` / `extract_from_db` → `finally: db_teardown`
 
@@ -757,17 +808,18 @@ files:
 
 ```
 0. _collect_error 检测 → 有则立即 pytest.fail
+0.1 variable_scope.set_context(case_id, case_file)   进入用例作用域上下文（finally clear_context）
 0.5 依赖判定：check_dependencies → 上游 failed/skipped/未执行 → pytest.skip（带原因）
-0.6 条件判定：run_if 存在且不满足 → pytest.skip（带原因）
+0.6 条件判定：run_if 对 variable_scope.view() 求值 → 不满足 → pytest.skip（带原因）
 1. Allure 动态打标
      title       = case.name
      description = case.description
      labels      = case_file, env
      tags        = case.tags
 2. allure.step("执行文件前置步骤(setup)")
-     → setup_runner.ensure_setup(...)
+     → setup_runner.ensure_setup(...)（提取写入文件作用域层）
      → 失败则 pytest.fail（同文件后续用例直接命中 _setup_failed 缓存）
-3. 断言期望值变量替换：assertions = replace_variables(case.assertions, global_vars)
+3. 断言期望值变量替换：assertions = replace_variables(case.assertions, variable_scope.view())
 4. db_setup（可选）：_require_db 检查 → 逐条 SQL 执行（支持 ${var}），attach SQL 与影响行数
 5. try:
      请求(可选，纯 DB 用例可无 request)：
@@ -782,10 +834,10 @@ files:
 8. extract（可选，需 response 非空）：
      allure.step("提取变量")
        for var_name, jsonpath:
-           global_vars[var_name] = 取值
+           variable_scope.extract(var_name, 取值)   写入用例作用域层（含覆盖检测）
            register_extracted（敏感键注册到文本替换）
-           log & attach 脱敏后的 key=value
-9. extract_from_db（可选）：_require_db 检查 → 每条 SQL 取首行首列写入 global_vars
+           log & attach 脱敏后的 key=value（含作用域标签）
+9. extract_from_db（可选）：_require_db 检查 → 每条 SQL 取首行首列写入用例作用域层
 10. finally: db_teardown（可选）：无论断言成败都执行，防止数据残留
      → 清理失败记录 teardown_error，最终 pytest.fail 提示数据可能残留
 ```
@@ -891,6 +943,9 @@ db_client.py        ← 仅依赖 config.PROJECT_ROOT；被 conftest / test_exec
 
 dependency.py       ← 仅依赖 masking（skip消息脱敏）；被 case_collector（RUN_IF_OPS 枚举）/
                        conftest（清空注册表）/ test_executor（登记结果+判定）引用
+
+variable_scope.py   ← 无内部依赖（仅 loguru）；被 conftest（构建闭包表+session fixture）/
+                       test_executor（上下文+提取）/ setup_runner（文件层写入）引用
 ```
 
 **依赖表（谁 import 谁）**：
@@ -900,6 +955,7 @@ dependency.py       ← 仅依赖 masking（skip消息脱敏）；被 case_colle
 | config.py | （无） |
 | masking.py | （无） |
 | yaml_parser.py | （无） |
+| variable_scope.py | （无） |
 | http_client.py | masking.mask_data；config.get_config（懒加载） |
 | assertion.py | （无；第三方 jsonpath-ng） |
 | dependency.py | masking.mask_data |
@@ -1041,7 +1097,6 @@ extract:                            # 可选
 ```yaml
 description: "..."
 tags: ["..."]
-global_vars:                        # 注释占位（当前由 setup / extract 注入，global_vars 暂未直接使用，见 README）
 testcases:
   - name: "用例1"
     request: { ... }
@@ -1049,6 +1104,7 @@ testcases:
     extract:
       token: "data.token"
   - name: "用例2（引用上一步token）"
+    depends_on: ["用例1"]             # ${token} 沿依赖链传递；未声明则不可见（strict 作用域）
     request:
       headers: { Authorization: "Bearer ${token}" }
     ...
@@ -1076,16 +1132,22 @@ testcases:
     ...
 ```
 
-执行语义：同文件所有用例中，仅**第一条被 Pytest 执行时**触发 setup；该文件后续用例跳过 setup，直接复用 `global_vars`。若 setup 失败，该文件所有用例直接失败，原因会被缓存。
+执行语义：同文件所有用例中，仅**第一条被 Pytest 执行时**触发 setup；该文件后续用例跳过 setup，直接复用文件作用域层的变量。若 setup 失败，该文件所有用例直接失败，原因会被缓存。
 
 ### 8.4 变量提取与引用
 
+变量按分层作用域管理（详见 [4.12 variable_scope 模块](#412-variable_scopepy--变量作用域)）：
+
 | 方式 | 示例 | 生效范围 |
 |------|------|----------|
-| `extract:` + `global_vars` session fixture | 用例1 `extract.user_id = data.id` → 用例2 `${user_id}` | **本次 pytest session**，跨文件也可用 |
-| `config.yaml variables` 段 + `$ENV{}` | `test_mobile: "$ENV{TEST_MOBILE}"` → 用例中 `${test_mobile}` | 所有用例 |
+| `extract:` + `depends_on` 依赖链 | 用例1 `extract.user_id = data.id` → 下游 `depends_on` 后 `${user_id}` | 本用例 + 沿依赖链的下游（传递闭包，跨文件依赖同样生效） |
+| 文件 `setup` 提取 | setup `extract.token` → 本文件用例 `${token}` | **本文件**所有用例（文件作用域）；`cache: true` 命中时同样导入目标文件层 |
+| `config.yaml variables` 段 + `$ENV{}` | `test_mobile: "$ENV{TEST_MOBILE}"` → 用例中 `${test_mobile}` | 所有用例（session 层） |
+| 内置造数函数 | `${uuid()}` / `${timestamp()}` / `${rand_str(8)}` / `${rand_mobile()}` / `${rand_int(1,100)}` | 当前用例内生成且**相同表达式结果稳定**，跨用例重新生成（见 4.3） |
 | 整串占位符保留类型 | `expected: "${count}"` 其中 count=5 int → 比较时仍为 int | 断言 expected 中常用 |
 | 嵌入占位符做字符串插值 | `"Bearer ${token}"` | URL / Header / JSON 值中任意位置 |
+
+未声明 `depends_on` 却引用上游变量：`${var}` 保持字面量原样发出（strict 模式默认行为，立即暴露漏声明的依赖）。同名覆盖默认告警（`variable_scope.overwrite: warn`，可配 `fail`/`silent`）。
 
 ### 8.5 文件上传 files
 
@@ -1221,7 +1283,7 @@ testcases:
 
 ### 8.9 用例依赖与条件执行
 
-跨用例传参（`extract` + `${var}`）解决"数据从哪来"，`depends_on` / `run_if` 解决"什么时候该执行"。
+跨用例传参（`extract` + `${var}`）解决"数据从哪来"，`depends_on` / `run_if` 解决"什么时候该执行"。strict 作用域下 `depends_on` 同时是变量传递通道：传递闭包内上游的 extract 产物对本用例可见。
 
 #### depends_on：显式依赖声明
 
@@ -1248,7 +1310,7 @@ testcases:
 ```yaml
   - name: "4. 支付订单"
     run_if:
-      var: sku_price        # 取自 global_vars（extract / extract_from_db / setup / 预置变量）
+      var: sku_price        # 取自作用域视图（本用例 / 链路上游 / 文件setup / 预置变量）
       op: gt                # 默认 eq
       value: 0              # 支持 ${var} 引用其他变量
 ```

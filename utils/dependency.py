@@ -9,7 +9,7 @@
   下游 pytest.skip 并给出具体原因，避免带着未替换的字面量 "${var}" 产生误导性失败
 - 收集期已按依赖图拓扑排序，正常整批执行时读到的一定是上游的最终结果；
   注册表里的"未执行"分支只在上游被圈选过滤时出现
-- pytest-xdist 并行与 session 级 global_vars 本就不兼容（既有约束），注册表同样仅支持单进程
+- pytest-xdist 并行与作用域变量/注册表均不兼容（既有约束），仅支持单进程
 """
 from typing import Any, Dict, Optional
 
@@ -47,12 +47,13 @@ def check_dependencies(case: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def evaluate_run_if(run_if: Dict[str, Any], global_vars: Dict[str, Any],
+def evaluate_run_if(run_if: Dict[str, Any], variables: Dict[str, Any],
                     yaml_parser) -> Optional[str]:
     """求值条件执行 run_if：{var, op, value}
 
     返回 None 表示条件满足可继续执行；返回字符串为应 skip 的原因。
-    var 取自 global_vars（extract / extract_from_db / setup 提取的变量与预置变量），
+    var 取自当前用例的作用域视图 variable_scope.view()
+    （本用例产出 / 依赖链上游 / 文件setup / session 预置，按优先级解析），
     value 支持 ${var} 引用其他变量。
     """
     var_name = run_if.get("var")
@@ -60,13 +61,13 @@ def evaluate_run_if(run_if: Dict[str, Any], global_vars: Dict[str, Any],
     if op not in RUN_IF_OPS:
         return f"run_if 使用了不支持的比较符: {op}（支持: {', '.join(RUN_IF_OPS)}），跳过"
 
-    actual = global_vars.get(var_name)
+    actual = variables.get(var_name)
     if op == "exists":
         return None if actual is not None else f"条件不满足: 变量 {var_name} 不存在，跳过"
     if op == "not_exists":
-        return None if actual is None else f"条件不满足: 变量 {var_name} 已存在，跳过"
+        return None if actual is not None else f"条件不满足: 变量 {var_name} 已存在，跳过"
 
-    expected = yaml_parser.replace_variables(run_if.get("value"), global_vars)
+    expected = yaml_parser.replace_variables(run_if.get("value"), variables)
     satisfied, reason = _compare(actual, op, expected)
     if satisfied:
         return None
